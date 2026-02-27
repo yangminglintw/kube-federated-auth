@@ -20,9 +20,10 @@ var Version = "dev"
 func main() {
 	configPath := flag.String("config", getEnv("CONFIG_PATH", "config/clusters.yaml"), "path to cluster config file")
 	port := flag.String("port", getEnv("PORT", "8080"), "server port")
-	namespace := flag.String("namespace", getEnv("NAMESPACE", "kube-federated-auth"), "namespace for credential secret")
 	secretName := flag.String("secret-name", getEnv("SECRET_NAME", "kube-federated-auth"), "name of credential secret")
 	flag.Parse()
+
+	namespace := detectNamespace()
 
 	cfg, err := config.Load(*configPath)
 	if err != nil {
@@ -36,7 +37,7 @@ func main() {
 	remoteClusters := cfg.GetRemoteClusters()
 	if len(remoteClusters) > 0 {
 		var err error
-		credStore, err = credentials.NewStore(*namespace, *secretName)
+		credStore, err = credentials.NewStore(namespace, *secretName)
 		if err != nil {
 			log.Fatalf("Failed to create credential store: %v", err)
 		}
@@ -78,6 +79,13 @@ func main() {
 	if err := http.ListenAndServe(addr, srv.Handler); err != nil {
 		log.Fatalf("Server failed: %v", err)
 	}
+}
+
+func detectNamespace() string {
+	if ns, err := os.ReadFile("/var/run/secrets/kubernetes.io/serviceaccount/namespace"); err == nil {
+		return string(ns)
+	}
+	return "kube-federated-auth"
 }
 
 func getEnv(key, fallback string) string {
