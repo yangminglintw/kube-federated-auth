@@ -92,6 +92,8 @@ func (s *Store) loadFromSecret(ctx context.Context) error {
 		return nil
 	}
 
+	log.Printf("Loading credentials from secret %s/%s", s.namespace, s.secretName)
+
 	secret, err := s.client.CoreV1().Secrets(s.namespace).Get(ctx, s.secretName, metav1.GetOptions{})
 	if err != nil {
 		if errors.IsNotFound(err) {
@@ -101,18 +103,32 @@ func (s *Store) loadFromSecret(ctx context.Context) error {
 		return fmt.Errorf("getting secret: %w", err)
 	}
 
+	log.Printf("Found secret %s/%s with %d data keys", s.namespace, s.secretName, len(secret.Data))
+
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
 	// Parse tokens from secret data (CA certs are loaded from files, not the secret)
 	// Format: {name}-token
 	for key, value := range secret.Data {
-		if strings.HasSuffix(key, "-token") {
-			cluster := strings.TrimSuffix(key, "-token")
-			s.credentials[cluster] = &Credentials{
-				Token: string(value),
-			}
-			log.Printf("Loaded token for cluster %s from secret", cluster)
+		if !strings.HasSuffix(key, "-token") {
+			log.Printf("Skipping secret key %q (no -token suffix)", key)
+			continue
+		}
+		cluster := strings.TrimSuffix(key, "-token")
+		token := string(value)
+		if token == "" {
+			log.Printf("WARNING: secret key %q has empty token value", key)
+			continue
+		}
+		exp, err := getTokenExpiration(token)
+		if err != nil {
+			log.Printf("WARNING: secret key %q has invalid token: %v", key, err)
+		} else {
+			log.Printf("Loaded token for cluster %s from secret (expires: %s)", cluster, exp.Format("2006-01-02T15:04:05Z"))
+		}
+		s.credentials[cluster] = &Credentials{
+			Token: token,
 		}
 	}
 
