@@ -6,6 +6,9 @@ KUBE_CONTEXT="${KUBE_CONTEXT:-kind-cluster-a}"
 NAMESPACE="${NAMESPACE:-kube-federated-auth}"
 TEST_CLIENT="${TEST_CLIENT:-deployment/test-client}"
 
+KUBE_CONTEXT_B="${KUBE_CONTEXT_B:-kind-cluster-b}"
+NAMESPACE_B="${NAMESPACE_B:-kube-federated-auth}"
+
 SERVICE_URL="${SERVICE_URL:-http://kube-federated-auth}"
 CLUSTER_NAME="${CLUSTER_NAME:-cluster-a}"
 TOKEN_PATH="${TOKEN_PATH:-/var/run/secrets/tokens/token}"
@@ -35,6 +38,11 @@ token_review() {
         -H "Content-Type: application/json" \
         -H "Authorization: Bearer ${caller_token}" \
         -d "{\"apiVersion\":\"authentication.k8s.io/v1\",\"kind\":\"TokenReview\",\"spec\":{\"token\":\"${token}\"}}"
+}
+
+# Create a short-lived token from cluster-b's reader SA
+get_cluster_b_token() {
+    kubectl --context "$KUBE_CONTEXT_B" -n "$NAMESPACE_B" create token kube-federated-auth-reader --duration=10m
 }
 
 # Wait for a service to be ready (up to 30 seconds)

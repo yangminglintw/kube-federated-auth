@@ -89,6 +89,38 @@ setup() {
     [[ "$username" == system:serviceaccount:* ]]
 }
 
+@test "TokenReview authenticates cluster-b token" {
+    # Caller: whitelisted SA from cluster-a (Authorization header)
+    # Payload: SA token from cluster-b (TokenReview body)
+    local caller_token
+    caller_token=$(get_caller_token)
+
+    local review_token
+    review_token=$(get_cluster_b_token)
+
+    local result
+    result=$(kexec curl -s -X POST "${SERVICE_URL}/apis/authentication.k8s.io/v1/tokenreviews" \
+        -H "Content-Type: application/json" \
+        -H "Authorization: Bearer ${caller_token}" \
+        -d "{\"apiVersion\":\"authentication.k8s.io/v1\",\"kind\":\"TokenReview\",\"spec\":{\"token\":\"${review_token}\"}}")
+
+    echo "# Response: $result"
+
+    local authenticated
+    authenticated=$(echo "$result" | jq -r '.status.authenticated')
+    [[ "$authenticated" == "true" ]]
+
+    # Verify identity is from cluster-b's reader SA
+    local username
+    username=$(echo "$result" | jq -r '.status.user.username')
+    [[ "$username" == "system:serviceaccount:kube-federated-auth:kube-federated-auth-reader" ]]
+
+    # Verify cluster-name extra field says cluster-b
+    local clusterExtra
+    clusterExtra=$(echo "$result" | jq -r '.status.user.extra["authentication.kubernetes.io/cluster-name"][0]')
+    [[ "$clusterExtra" == "cluster-b" ]]
+}
+
 @test "TokenReview rejects invalid token" {
     local result
     result=$(token_review "invalid.token.here")
