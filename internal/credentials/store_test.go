@@ -43,15 +43,14 @@ func TestLoadBootstrapFromFiles_LoadsWhenEmpty(t *testing.T) {
 	}
 }
 
-func TestLoadBootstrapFromFiles_SkipsWhenAlreadyPresent(t *testing.T) {
+func TestLoadBootstrapFromFiles_PreservesTokenButLoadsCA(t *testing.T) {
 	dir := t.TempDir()
 	tokenPath, caPath := writeTestFiles(t, dir, "bootstrap-token", "bootstrap-ca")
 
 	store := newTestStore()
-	// Pre-populate with "renewed" credentials (as if loaded from Secret)
+	// Pre-populate with token only (as if loaded from Secret, which no longer stores CA)
 	store.credentials["cluster-b"] = &Credentials{
-		Token:  "renewed-token",
-		CACert: []byte("renewed-ca"),
+		Token: "renewed-token",
 	}
 
 	if err := store.LoadBootstrapFromFiles("cluster-b", tokenPath, caPath); err != nil {
@@ -61,6 +60,9 @@ func TestLoadBootstrapFromFiles_SkipsWhenAlreadyPresent(t *testing.T) {
 	creds, _ := store.Get("cluster-b")
 	if creds.Token != "renewed-token" {
 		t.Errorf("expected existing token 'renewed-token' to be preserved, got '%s'", creds.Token)
+	}
+	if string(creds.CACert) != "bootstrap-ca" {
+		t.Errorf("expected CA cert 'bootstrap-ca' to be loaded from file, got '%s'", string(creds.CACert))
 	}
 }
 

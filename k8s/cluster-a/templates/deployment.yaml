@@ -26,8 +26,11 @@ spec:
         - name: config
           mountPath: /etc/kube-federated-auth
           readOnly: true
-        - name: cluster-certs
-          mountPath: /etc/kube-federated-auth/certs
+        - name: cluster-tokens
+          mountPath: /etc/kube-federated-auth/tokens
+          readOnly: true
+        - name: cluster-ca-certs
+          mountPath: /etc/kube-federated-auth/ca-certs
           readOnly: true
         livenessProbe:
           httpGet:
@@ -45,7 +48,11 @@ spec:
       - name: config
         configMap:
           name: kube-federated-auth
-      - name: cluster-certs
+      - name: cluster-tokens
         secret:
           secretName: kube-federated-auth
+          optional: true
+      - name: cluster-ca-certs
+        configMap:
+          name: kube-federated-auth-certs
           optional: true

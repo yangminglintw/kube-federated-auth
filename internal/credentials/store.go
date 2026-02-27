@@ -2,7 +2,6 @@ package credentials
 
 import (
 	"context"
-	"encoding/base64"
 	"fmt"
 	"log"
 	"os"
@@ -105,30 +104,15 @@ func (s *Store) loadFromSecret(ctx context.Context) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	// Parse credentials from secret data
-	// Format: {name}-token, {name}-ca.crt
-	clusters := make(map[string]bool)
-	for key := range secret.Data {
+	// Parse tokens from secret data (CA certs are loaded from files, not the secret)
+	// Format: {name}-token
+	for key, value := range secret.Data {
 		if strings.HasSuffix(key, "-token") {
-			clusters[strings.TrimSuffix(key, "-token")] = true
-		} else if strings.HasSuffix(key, "-ca.crt") {
-			clusters[strings.TrimSuffix(key, "-ca.crt")] = true
-		}
-	}
-
-	for cluster := range clusters {
-		tokenKey := fmt.Sprintf("%s-token", cluster)
-		caKey := fmt.Sprintf("%s-ca.crt", cluster)
-
-		token, hasToken := secret.Data[tokenKey]
-		ca, hasCA := secret.Data[caKey]
-
-		if hasToken && hasCA {
+			cluster := strings.TrimSuffix(key, "-token")
 			s.credentials[cluster] = &Credentials{
-				Token:  string(token),
-				CACert: ca,
+				Token: string(value),
 			}
-			log.Printf("Loaded credentials for cluster %s from secret", cluster)
+			log.Printf("Loaded token for cluster %s from secret", cluster)
 		}
 	}
 
@@ -145,7 +129,6 @@ func (s *Store) saveToSecret(ctx context.Context) error {
 	data := make(map[string][]byte)
 	for cluster, creds := range s.credentials {
 		data[fmt.Sprintf("%s-token", cluster)] = []byte(creds.Token)
-		data[fmt.Sprintf("%s-ca.crt", cluster)] = creds.CACert
 	}
 	s.mu.RUnlock()
 
@@ -175,14 +158,35 @@ func (s *Store) saveToSecret(ctx context.Context) error {
 	return nil
 }
 
-// LoadBootstrapFromFiles loads bootstrap credentials from files only if the store
-// doesn't already have credentials for the cluster (e.g., from a persisted Secret).
+// LoadBootstrapFromFiles loads bootstrap credentials from files.
+// CA cert is always loaded from file (not persisted in the Secret).
+// Token is only loaded from file if not already present (e.g., from a persisted Secret).
 func (s *Store) LoadBootstrapFromFiles(cluster, tokenPath, caPath string) error {
-	if _, ok := s.Get(cluster); ok {
-		log.Printf("Skipping bootstrap for cluster %s: credentials already loaded from secret", cluster)
+	ca, err := os.ReadFile(caPath)
+	if err != nil {
+		return fmt.Errorf("reading CA file: %w", err)
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if existing, ok := s.credentials[cluster]; ok {
+		existing.CACert = ca
+		log.Printf("Loaded CA cert for cluster %s from file (token already from secret)", cluster)
 		return nil
 	}
-	return s.LoadFromFiles(cluster, tokenPath, caPath)
+
+	token, err := os.ReadFile(tokenPath)
+	if err != nil {
+		return fmt.Errorf("reading token file: %w", err)
+	}
+
+	s.credentials[cluster] = &Credentials{
+		Token:  string(token),
+		CACert: ca,
+	}
+	log.Printf("Loaded bootstrap credentials for cluster %s from files", cluster)
+	return nil
 }
 
 // LoadFromFiles loads bootstrap credentials from files (for initial setup)
@@ -206,9 +210,4 @@ func (s *Store) LoadFromFiles(cluster, tokenPath, caPath string) error {
 
 	log.Printf("Loaded bootstrap credentials for cluster %s from files", cluster)
 	return nil
-}
-
-// ParseBase64CACert decodes a base64-encoded CA certificate
-func ParseBase64CACert(encoded string) ([]byte, error) {
-	return base64.StdEncoding.DecodeString(encoded)
 }

@@ -8,6 +8,7 @@ CLUSTER_A="cluster-a"
 CLUSTER_B="cluster-b"
 NAMESPACE="kube-federated-auth"
 SECRET_NAME="kube-federated-auth"
+CONFIGMAP_NAME="kube-federated-auth-certs"
 
 echo "=========================================="
 echo "Configuring Multi-Cluster Authentication"
@@ -19,7 +20,21 @@ source skaffold.env
 echo "Cluster-A API Server IP: $CLUSTER_A_IP"
 echo "Cluster-B API Server IP: $CLUSTER_B_IP"
 
-# Check if secret already exists in cluster-a
+# Create namespace in cluster-a if it doesn't exist
+kubectl --context=kind-${CLUSTER_A} create namespace ${NAMESPACE} --dry-run=client -o yaml | kubectl --context=kind-${CLUSTER_A} apply -f -
+
+# Always create/update the CA cert ConfigMap (public data, safe to overwrite)
+echo "Extracting CA certificate from cluster-b..."
+CA_CERT=$(kubectl --context=kind-${CLUSTER_B} get configmap kube-root-ca.crt -n kube-system -o jsonpath='{.data.ca\.crt}')
+echo "  ✅ CA certificate extracted"
+
+echo "Creating CA certificate ConfigMap in cluster-a..."
+kubectl --context=kind-${CLUSTER_A} --namespace=${NAMESPACE} create configmap ${CONFIGMAP_NAME} \
+  --from-literal=cluster-b-ca.crt="${CA_CERT}" \
+  --dry-run=client -o yaml | kubectl --context=kind-${CLUSTER_A} apply -f -
+echo "  ✅ CA certificate ConfigMap created"
+
+# Check if secret already exists in cluster-a (token only)
 if kubectl --context=kind-${CLUSTER_A} --namespace=${NAMESPACE} get secret ${SECRET_NAME} >/dev/null 2>&1; then
   echo "✅ Credentials secret already exists in cluster-a, skipping bootstrap"
   TOKEN=$(kubectl --context=kind-${CLUSTER_A} --namespace=${NAMESPACE} get secret ${SECRET_NAME} -o jsonpath='{.data.cluster-b-token}' | base64 -d)
@@ -31,19 +46,10 @@ else
   TOKEN=$(kubectl --context=kind-${CLUSTER_B} --namespace=${NAMESPACE} create token kube-federated-auth-reader --duration=168h)
   echo "  ✅ Bootstrap token created (7 day TTL)"
 
-  # Extract CA certificate
-  echo "  Extracting CA certificate from cluster-b..."
-  CA_CERT=$(kubectl --context=kind-${CLUSTER_B} get configmap kube-root-ca.crt -n kube-system -o jsonpath='{.data.ca\.crt}')
-  echo "  ✅ CA certificate extracted"
-
-  # Create namespace in cluster-a if it doesn't exist
-  kubectl --context=kind-${CLUSTER_A} create namespace ${NAMESPACE} --dry-run=client -o yaml | kubectl --context=kind-${CLUSTER_A} apply -f -
-
-  # Create the secret in cluster-a
+  # Create the secret in cluster-a (token only)
   echo "  Creating credentials secret in cluster-a..."
   kubectl --context=kind-${CLUSTER_A} --namespace=${NAMESPACE} create secret generic ${SECRET_NAME} \
-    --from-literal=cluster-b-token="${TOKEN}" \
-    --from-literal=cluster-b-ca.crt="${CA_CERT}"
+    --from-literal=cluster-b-token="${TOKEN}"
   echo "  ✅ Credentials secret created"
 fi
 
