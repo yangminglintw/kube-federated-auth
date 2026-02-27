@@ -5,9 +5,25 @@ import (
 	"log/slog"
 	"net/http"
 	"time"
-
-	chimw "github.com/go-chi/chi/v5/middleware"
 )
+
+// statusResponseWriter wraps http.ResponseWriter to capture the status code.
+type statusResponseWriter struct {
+	http.ResponseWriter
+	status int
+}
+
+func (w *statusResponseWriter) WriteHeader(code int) {
+	w.status = code
+	w.ResponseWriter.WriteHeader(code)
+}
+
+func (w *statusResponseWriter) Status() int {
+	if w.status == 0 {
+		return http.StatusOK
+	}
+	return w.status
+}
 
 type contextKey int
 
@@ -63,7 +79,7 @@ func RequestLogger(logger *slog.Logger) func(http.Handler) http.Handler {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			start := time.Now()
-			ww := chimw.NewWrapResponseWriter(w, r.ProtoMajor)
+			ww := &statusResponseWriter{ResponseWriter: w}
 
 			next.ServeHTTP(ww, r)
 

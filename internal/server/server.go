@@ -4,8 +4,6 @@ import (
 	"log/slog"
 	"net/http"
 
-	"github.com/go-chi/chi/v5"
-	chimw "github.com/go-chi/chi/v5/middleware"
 	"github.com/rophy/kube-federated-auth/internal/config"
 	"github.com/rophy/kube-federated-auth/internal/credentials"
 	"github.com/rophy/kube-federated-auth/internal/handler"
@@ -20,25 +18,20 @@ type Server struct {
 }
 
 func New(cfg *config.Config, credStore *credentials.Store, version string) *Server {
-	r := chi.NewRouter()
-
-	r.Use(chimw.Recoverer)
-	r.Use(chimw.RequestID)
-
 	verifier := oidc.NewVerifierManager(cfg, credStore)
+	logged := mw.RequestLogger(slog.Default())
+
+	mux := http.NewServeMux()
 
 	// Health endpoint without request logging to avoid spam from probes
-	r.Get("/health", handler.NewHealthHandler(version).ServeHTTP)
+	mux.Handle("GET /health", handler.NewHealthHandler(version))
 
-	// All other routes with slog-based request logging
-	r.Group(func(r chi.Router) {
-		r.Use(mw.RequestLogger(slog.Default()))
-		r.Get("/clusters", handler.NewClustersHandler(cfg, credStore).ServeHTTP)
-		r.Post("/apis/authentication.k8s.io/v1/tokenreviews", handler.NewTokenReviewHandler(verifier, cfg, credStore).ServeHTTP)
-	})
+	// Routes with slog-based request logging
+	mux.Handle("GET /clusters", logged(handler.NewClustersHandler(cfg, credStore)))
+	mux.Handle("POST /apis/authentication.k8s.io/v1/tokenreviews", logged(handler.NewTokenReviewHandler(verifier, cfg, credStore)))
 
 	return &Server{
-		Handler:  r,
+		Handler:  mw.Recoverer(mux),
 		Verifier: verifier,
 	}
 }
