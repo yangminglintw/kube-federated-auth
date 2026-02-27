@@ -195,7 +195,6 @@ func rewriteJWKSURL(jwksURL, apiServer string) string {
 func (m *VerifierManager) createHTTPClient(clusterName string, cfg config.ClusterConfig) (*http.Client, error) {
 	var transport http.RoundTripper = http.DefaultTransport
 
-	// Check for dynamic credentials first
 	var caCert []byte
 	var token string
 
@@ -203,15 +202,6 @@ func (m *VerifierManager) createHTTPClient(clusterName string, cfg config.Cluste
 		if creds, ok := m.credStore.Get(clusterName); ok {
 			caCert = creds.CACert
 			token = creds.Token
-		}
-	}
-
-	// Fall back to file-based credentials if no dynamic credentials
-	if caCert == nil && cfg.CACert != "" {
-		var err error
-		caCert, err = os.ReadFile(cfg.CACert)
-		if err != nil {
-			return nil, fmt.Errorf("reading CA cert: %w", err)
 		}
 	}
 

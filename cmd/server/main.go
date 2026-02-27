@@ -46,11 +46,18 @@ func main() {
 			os.Exit(1)
 		}
 
-		// Load bootstrap credentials from files for clusters not already in the store
+		// Load CA certs and bootstrap tokens separately — they have different lifecycles:
+		// - CA certs: long-lived, always from file, never persisted in Secret
+		// - Tokens: short-lived, from Secret if available, otherwise from bootstrap file
 		for clusterName, clusterCfg := range cfg.Clusters {
-			if clusterCfg.TokenPath != "" && clusterCfg.CACert != "" {
-				if err := credStore.LoadBootstrapFromFiles(clusterName, clusterCfg.TokenPath, clusterCfg.CACert); err != nil {
-					slog.Warn("could not load bootstrap credentials", "cluster", clusterName, "error", err)
+			if clusterCfg.CACert != "" {
+				if err := credStore.LoadCACertFromFile(clusterName, clusterCfg.CACert); err != nil {
+					slog.Warn("could not load CA cert", "cluster", clusterName, "error", err)
+				}
+			}
+			if clusterCfg.TokenPath != "" {
+				if err := credStore.LoadBootstrapToken(clusterName, clusterCfg.TokenPath); err != nil {
+					slog.Warn("could not load bootstrap token", "cluster", clusterName, "error", err)
 				}
 			}
 		}

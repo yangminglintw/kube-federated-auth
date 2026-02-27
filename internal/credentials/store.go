@@ -175,10 +175,9 @@ func (s *Store) saveToSecret(ctx context.Context) error {
 	return nil
 }
 
-// LoadBootstrapFromFiles loads bootstrap credentials from files.
-// CA cert is always loaded from file (not persisted in the Secret).
-// Token is only loaded from file if not already present (e.g., from a persisted Secret).
-func (s *Store) LoadBootstrapFromFiles(cluster, tokenPath, caPath string) error {
+// LoadCACertFromFile loads a CA certificate from file into the credential store.
+// CA certs are long-lived and always read from mounted files, never persisted in the Secret.
+func (s *Store) LoadCACertFromFile(cluster, caPath string) error {
 	ca, err := os.ReadFile(caPath)
 	if err != nil {
 		return fmt.Errorf("reading CA file: %w", err)
@@ -189,7 +188,22 @@ func (s *Store) LoadBootstrapFromFiles(cluster, tokenPath, caPath string) error 
 
 	if existing, ok := s.credentials[cluster]; ok {
 		existing.CACert = ca
-		slog.Info("loaded CA cert from file", "cluster", cluster)
+	} else {
+		s.credentials[cluster] = &Credentials{CACert: ca}
+	}
+
+	slog.Info("loaded CA cert from file", "cluster", cluster)
+	return nil
+}
+
+// LoadBootstrapToken loads a bootstrap token from file, only if no token is already present
+// (e.g., from a persisted Secret). Tokens are short-lived and will be renewed and persisted.
+func (s *Store) LoadBootstrapToken(cluster, tokenPath string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if existing, ok := s.credentials[cluster]; ok && existing.Token != "" {
+		slog.Info("token already present, skipping bootstrap", "cluster", cluster)
 		return nil
 	}
 
@@ -198,15 +212,18 @@ func (s *Store) LoadBootstrapFromFiles(cluster, tokenPath, caPath string) error 
 		return fmt.Errorf("reading token file: %w", err)
 	}
 
-	s.credentials[cluster] = &Credentials{
-		Token:  string(token),
-		CACert: ca,
+	if existing, ok := s.credentials[cluster]; ok {
+		existing.Token = string(token)
+	} else {
+		s.credentials[cluster] = &Credentials{Token: string(token)}
 	}
-	slog.Info("loaded bootstrap credentials from files", "cluster", cluster)
+
+	slog.Info("loaded bootstrap token from file", "cluster", cluster)
 	return nil
 }
 
-// LoadFromFiles loads bootstrap credentials from files (for initial setup)
+// LoadFromFiles loads both token and CA cert from files, overwriting any existing credentials.
+// Used by the renewer for bootstrap fallback when the current token fails.
 func (s *Store) LoadFromFiles(cluster, tokenPath, caPath string) error {
 	token, err := os.ReadFile(tokenPath)
 	if err != nil {
@@ -225,6 +242,6 @@ func (s *Store) LoadFromFiles(cluster, tokenPath, caPath string) error {
 	}
 	s.mu.Unlock()
 
-	slog.Info("loaded bootstrap credentials from files", "cluster", cluster)
+	slog.Info("loaded credentials from files", "cluster", cluster)
 	return nil
 }

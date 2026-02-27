@@ -2,14 +2,12 @@ package credentials
 
 import (
 	"context"
-	"crypto/tls"
 	"crypto/x509"
 	"encoding/base64"
 	"encoding/json"
 	"encoding/pem"
 	"fmt"
 	"log/slog"
-	"os"
 	"strings"
 	"time"
 
@@ -274,47 +272,13 @@ func checkCACertExpiration(cluster string, caCertPEM []byte) {
 }
 
 func (r *Renewer) createClient(cfg config.ClusterConfig, creds *Credentials) (kubernetes.Interface, error) {
-	// Load CA cert
-	var caCert []byte
-	if creds != nil && len(creds.CACert) > 0 {
-		caCert = creds.CACert
-	} else if cfg.CACert != "" {
-		var err error
-		caCert, err = os.ReadFile(cfg.CACert)
-		if err != nil {
-			return nil, fmt.Errorf("reading CA cert: %w", err)
-		}
-	}
-
-	// Build TLS config
-	tlsConfig := &tls.Config{}
-	if len(caCert) > 0 {
-		caCertPool := x509.NewCertPool()
-		if !caCertPool.AppendCertsFromPEM(caCert) {
-			return nil, fmt.Errorf("failed to parse CA cert")
-		}
-		tlsConfig.RootCAs = caCertPool
-	}
-
-	// Get token
-	var token string
-	if creds != nil && creds.Token != "" {
-		token = creds.Token
-	} else if cfg.TokenPath != "" {
-		tokenBytes, err := os.ReadFile(cfg.TokenPath)
-		if err != nil {
-			return nil, fmt.Errorf("reading token: %w", err)
-		}
-		token = string(tokenBytes)
-	}
-
-	// Create REST config
 	restConfig := &rest.Config{
-		Host:        cfg.APIServer,
-		BearerToken: token,
-		TLSClientConfig: rest.TLSClientConfig{
-			CAData: caCert,
-		},
+		Host: cfg.APIServer,
+	}
+
+	if creds != nil {
+		restConfig.BearerToken = creds.Token
+		restConfig.TLSClientConfig.CAData = creds.CACert
 	}
 
 	return kubernetes.NewForConfig(restConfig)
