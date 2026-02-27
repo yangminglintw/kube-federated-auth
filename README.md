@@ -51,6 +51,11 @@ docker run -v $(pwd)/config:/etc/kube-federated-auth ghcr.io/rophy/kube-federate
 
 ```yaml
 # config/clusters.yaml
+authorized_clients:
+  - "cluster-a/kube-federated-auth/test-client"  # exact match
+  - "*/default/my-app"                            # any cluster
+  - "cluster-b/*/*"                               # any SA in cluster-b
+
 renewal:
   interval: "1h"          # How often to check for renewal
   token_duration: "168h"  # Requested token TTL (7 days)
@@ -68,6 +73,19 @@ clusters:
     ca_cert: "/etc/kube-federated-auth/certs/cluster-b-ca.crt"
     token_path: "/etc/kube-federated-auth/certs/cluster-b-token"
 ```
+
+## Caller Authentication
+
+By default, the TokenReview endpoint is open to any caller. When `authorized_clients` is configured, callers are required to authenticate by including their own ServiceAccount token in the `Authorization` header. Each entry uses `{cluster}/{namespace}/{serviceaccount}` format, with `*` as a wildcard in any segment.
+
+```bash
+curl -X POST http://kube-federated-auth:8080/apis/authentication.k8s.io/v1/tokenreviews \
+  -H "Authorization: Bearer <caller-sa-token>" \
+  -H "Content-Type: application/json" \
+  -d '{ ... }'
+```
+
+The caller's token is verified via JWKS (same as regular token detection) and checked against the whitelist. If omitted or unauthorized, the request is rejected with `401` or `403`.
 
 ## RBAC Requirements
 
