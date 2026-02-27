@@ -45,6 +45,11 @@ get_cluster_b_token() {
     kubectl --context "$KUBE_CONTEXT_B" -n "$NAMESPACE_B" create token kube-federated-auth-reader --duration=10m
 }
 
+# Create a token from a SA that is NOT in the authorized_clients whitelist
+get_unauthorized_caller_token() {
+    kubectl --context "$KUBE_CONTEXT" -n "$NAMESPACE" create token default --duration=10m
+}
+
 # Wait for a service to be ready (up to 30 seconds)
 wait_for_service() {
     local url="${1:-${SERVICE_URL}/health}"

@@ -3,10 +3,11 @@ package credentials
 import (
 	"context"
 	"fmt"
-	"log"
+	"log/slog"
 	"os"
 	"strings"
 	"sync"
+	"time"
 
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
@@ -42,13 +43,13 @@ func NewStore(namespace, secretName string) (*Store, error) {
 	// Try to create in-cluster client
 	config, err := rest.InClusterConfig()
 	if err != nil {
-		log.Printf("Not running in cluster, credentials will not be persisted: %v", err)
+		slog.Info("not running in cluster, credentials will not be persisted", "error", err)
 		return s, nil
 	}
 
 	client, err := kubernetes.NewForConfig(config)
 	if err != nil {
-		log.Printf("Failed to create Kubernetes client, credentials will not be persisted: %v", err)
+		slog.Warn("failed to create kubernetes client, credentials will not be persisted", "error", err)
 		return s, nil
 	}
 
@@ -56,7 +57,7 @@ func NewStore(namespace, secretName string) (*Store, error) {
 
 	// Load existing credentials from Secret
 	if err := s.loadFromSecret(context.Background()); err != nil {
-		log.Printf("Failed to load credentials from secret: %v", err)
+		slog.Warn("failed to load credentials from secret", "error", err)
 	}
 
 	return s, nil
@@ -92,18 +93,18 @@ func (s *Store) loadFromSecret(ctx context.Context) error {
 		return nil
 	}
 
-	log.Printf("Loading credentials from secret %s/%s", s.namespace, s.secretName)
+	slog.Info("loading credentials from secret", "namespace", s.namespace, "secret", s.secretName)
 
 	secret, err := s.client.CoreV1().Secrets(s.namespace).Get(ctx, s.secretName, metav1.GetOptions{})
 	if err != nil {
 		if errors.IsNotFound(err) {
-			log.Printf("Credentials secret %s/%s not found, starting fresh", s.namespace, s.secretName)
+			slog.Info("credentials secret not found, starting fresh", "namespace", s.namespace, "secret", s.secretName)
 			return nil
 		}
 		return fmt.Errorf("getting secret: %w", err)
 	}
 
-	log.Printf("Found secret %s/%s with %d data keys", s.namespace, s.secretName, len(secret.Data))
+	slog.Info("found credentials secret", "namespace", s.namespace, "secret", s.secretName, "keys", len(secret.Data))
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -112,20 +113,20 @@ func (s *Store) loadFromSecret(ctx context.Context) error {
 	// Format: {name}-token
 	for key, value := range secret.Data {
 		if !strings.HasSuffix(key, "-token") {
-			log.Printf("Skipping secret key %q (no -token suffix)", key)
+			slog.Debug("skipping secret key", "key", key, "reason", "no -token suffix")
 			continue
 		}
 		cluster := strings.TrimSuffix(key, "-token")
 		token := string(value)
 		if token == "" {
-			log.Printf("WARNING: secret key %q has empty token value", key)
+			slog.Warn("secret key has empty token", "key", key)
 			continue
 		}
 		exp, err := getTokenExpiration(token)
 		if err != nil {
-			log.Printf("WARNING: secret key %q has invalid token: %v", key, err)
+			slog.Warn("secret key has invalid token", "key", key, "error", err)
 		} else {
-			log.Printf("Loaded token for cluster %s from secret (expires: %s)", cluster, exp.Format("2006-01-02T15:04:05Z"))
+			slog.Info("loaded token from secret", "cluster", cluster, "expires", exp.Format(time.RFC3339))
 		}
 		s.credentials[cluster] = &Credentials{
 			Token: token,
@@ -164,13 +165,13 @@ func (s *Store) saveToSecret(ctx context.Context) error {
 			if err != nil {
 				return fmt.Errorf("creating secret: %w", err)
 			}
-			log.Printf("Created credentials secret %s/%s", s.namespace, s.secretName)
+			slog.Info("created credentials secret", "namespace", s.namespace, "secret", s.secretName)
 			return nil
 		}
 		return fmt.Errorf("updating secret: %w", err)
 	}
 
-	log.Printf("Updated credentials secret %s/%s", s.namespace, s.secretName)
+	slog.Info("updated credentials secret", "namespace", s.namespace, "secret", s.secretName)
 	return nil
 }
 
@@ -188,7 +189,7 @@ func (s *Store) LoadBootstrapFromFiles(cluster, tokenPath, caPath string) error 
 
 	if existing, ok := s.credentials[cluster]; ok {
 		existing.CACert = ca
-		log.Printf("Loaded CA cert for cluster %s from file (token already from secret)", cluster)
+		slog.Info("loaded CA cert from file", "cluster", cluster)
 		return nil
 	}
 
@@ -201,7 +202,7 @@ func (s *Store) LoadBootstrapFromFiles(cluster, tokenPath, caPath string) error 
 		Token:  string(token),
 		CACert: ca,
 	}
-	log.Printf("Loaded bootstrap credentials for cluster %s from files", cluster)
+	slog.Info("loaded bootstrap credentials from files", "cluster", cluster)
 	return nil
 }
 
@@ -224,6 +225,6 @@ func (s *Store) LoadFromFiles(cluster, tokenPath, caPath string) error {
 	}
 	s.mu.Unlock()
 
-	log.Printf("Loaded bootstrap credentials for cluster %s from files", cluster)
+	slog.Info("loaded bootstrap credentials from files", "cluster", cluster)
 	return nil
 }

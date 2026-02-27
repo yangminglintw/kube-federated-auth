@@ -138,6 +138,34 @@ setup() {
     [[ "$error" != "null" ]]
 }
 
+@test "TokenReview rejects unauthorized caller with 403" {
+    # Use a valid token from a SA that is NOT in authorized_clients
+    local caller_token
+    caller_token=$(get_unauthorized_caller_token)
+
+    local review_token
+    review_token=$(get_token)
+
+    local http_code body
+    body=$(kexec curl -s -w '\n%{http_code}' -X POST \
+        "${SERVICE_URL}/apis/authentication.k8s.io/v1/tokenreviews" \
+        -H "Content-Type: application/json" \
+        -H "Authorization: Bearer ${caller_token}" \
+        -d "{\"apiVersion\":\"authentication.k8s.io/v1\",\"kind\":\"TokenReview\",\"spec\":{\"token\":\"${review_token}\"}}")
+
+    http_code=$(echo "$body" | tail -1)
+    body=$(echo "$body" | sed '$d')
+
+    echo "# HTTP status: $http_code"
+    echo "# Response: $body"
+
+    [[ "$http_code" == "403" ]]
+
+    local error
+    error=$(echo "$body" | jq -r '.status.error')
+    [[ "$error" == "caller is not authorized" ]]
+}
+
 @test "TokenReview rejects request without Authorization header" {
     # Send a TokenReview without caller auth — should get 401
     local http_code

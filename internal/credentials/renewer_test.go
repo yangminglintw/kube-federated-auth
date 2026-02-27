@@ -12,7 +12,7 @@ import (
 	"encoding/json"
 	"encoding/pem"
 	"fmt"
-	"log"
+	"log/slog"
 	"math/big"
 	"os"
 	"path/filepath"
@@ -29,6 +29,15 @@ import (
 
 	"github.com/rophy/kube-federated-auth/internal/config"
 )
+
+// captureLogs sets slog default to write to a buffer and returns a cleanup function.
+func captureLogs(t *testing.T) (*bytes.Buffer, func()) {
+	t.Helper()
+	var buf bytes.Buffer
+	prev := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug})))
+	return &buf, func() { slog.SetDefault(prev) }
+}
 
 // makeJWT creates a minimal JWT with the given claims for testing.
 func makeJWT(sub string, exp time.Time) string {
@@ -69,14 +78,13 @@ func TestCheckCACertExpiration_WarnsWhenExpiringSoon(t *testing.T) {
 	notBefore := time.Now().Add(-10*365*24*time.Hour + 30*24*time.Hour)
 	cert := generateCACert(notBefore, time.Now().Add(30*24*time.Hour))
 
-	var buf bytes.Buffer
-	log.SetOutput(&buf)
-	defer log.SetOutput(os.Stderr)
+	buf, cleanup := captureLogs(t)
+	defer cleanup()
 
 	checkCACertExpiration("test-cluster", cert)
 
 	output := buf.String()
-	if !strings.Contains(output, "WARNING") {
+	if !strings.Contains(output, "CA certificate expiring soon") {
 		t.Errorf("expected warning log, got: %s", output)
 	}
 	if !strings.Contains(output, "test-cluster") {
@@ -88,9 +96,8 @@ func TestCheckCACertExpiration_NoWarningWhenFarFromExpiry(t *testing.T) {
 	// 10-year cert issued now → 20% threshold is 2 years, remaining ~10 years → no warning
 	cert := generateCACert(time.Now(), time.Now().Add(10*365*24*time.Hour))
 
-	var buf bytes.Buffer
-	log.SetOutput(&buf)
-	defer log.SetOutput(os.Stderr)
+	buf, cleanup := captureLogs(t)
+	defer cleanup()
 
 	checkCACertExpiration("test-cluster", cert)
 
@@ -100,22 +107,20 @@ func TestCheckCACertExpiration_NoWarningWhenFarFromExpiry(t *testing.T) {
 }
 
 func TestCheckCACertExpiration_InvalidPEM(t *testing.T) {
-	var buf bytes.Buffer
-	log.SetOutput(&buf)
-	defer log.SetOutput(os.Stderr)
+	buf, cleanup := captureLogs(t)
+	defer cleanup()
 
 	checkCACertExpiration("test-cluster", []byte("not a pem"))
 
 	output := buf.String()
-	if !strings.Contains(output, "failed to decode") {
+	if !strings.Contains(output, "failed to decode CA certificate PEM") {
 		t.Errorf("expected decode error log, got: %s", output)
 	}
 }
 
 func TestCheckCACertExpiration_EmptyCert(t *testing.T) {
-	var buf bytes.Buffer
-	log.SetOutput(&buf)
-	defer log.SetOutput(os.Stderr)
+	buf, cleanup := captureLogs(t)
+	defer cleanup()
 
 	checkCACertExpiration("test-cluster", nil)
 
@@ -200,17 +205,16 @@ func TestRenew_SkipsWhenTokenNotExpiring(t *testing.T) {
 	r := NewRenewer(cfg, store, nil)
 	r.clientFactory = fakeClientFactory(fakeClient)
 
-	var buf bytes.Buffer
-	log.SetOutput(&buf)
-	defer log.SetOutput(os.Stderr)
+	buf, cleanup := captureLogs(t)
+	defer cleanup()
 
 	err := r.renew(context.Background(), "cluster-b", cfg.Clusters["cluster-b"])
 	if err != nil {
 		t.Fatalf("expected no error, got: %v", err)
 	}
 
-	if !strings.Contains(buf.String(), "Skipping renewal") {
-		t.Errorf("expected 'Skipping renewal' log, got: %s", buf.String())
+	if !strings.Contains(buf.String(), "skipping renewal") {
+		t.Errorf("expected 'skipping renewal' log, got: %s", buf.String())
 	}
 
 	// Token should NOT have been replaced
@@ -251,9 +255,8 @@ func TestRenew_FallsBackToBootstrapOnFailure(t *testing.T) {
 	r := NewRenewer(cfg, store, nil)
 	r.clientFactory = fakeClientFactory(fakeClient)
 
-	var buf bytes.Buffer
-	log.SetOutput(&buf)
-	defer log.SetOutput(os.Stderr)
+	buf, cleanup := captureLogs(t)
+	defer cleanup()
 
 	err := r.renew(context.Background(), "cluster-b", cfg.Clusters["cluster-b"])
 	if err != nil {
@@ -261,7 +264,7 @@ func TestRenew_FallsBackToBootstrapOnFailure(t *testing.T) {
 	}
 
 	output := buf.String()
-	if !strings.Contains(output, "retrying with bootstrap credentials") {
+	if !strings.Contains(output, "retrying with bootstrap") {
 		t.Errorf("expected bootstrap fallback log, got: %s", output)
 	}
 
@@ -298,9 +301,8 @@ func TestRenew_BothStoredAndBootstrapFail(t *testing.T) {
 	r := NewRenewer(cfg, store, nil)
 	r.clientFactory = fakeClientFactory(fakeClient)
 
-	var buf bytes.Buffer
-	log.SetOutput(&buf)
-	defer log.SetOutput(os.Stderr)
+	buf, cleanup := captureLogs(t)
+	defer cleanup()
 
 	err := r.renew(context.Background(), "cluster-b", cfg.Clusters["cluster-b"])
 	if err == nil {
@@ -308,11 +310,8 @@ func TestRenew_BothStoredAndBootstrapFail(t *testing.T) {
 	}
 
 	output := buf.String()
-	if !strings.Contains(output, "bootstrap token at "+tokenPath+" is invalid or expired") {
+	if !strings.Contains(output, "bootstrap token is invalid or expired") {
 		t.Errorf("expected 'bootstrap token is invalid or expired' log, got: %s", output)
-	}
-	if !strings.Contains(output, "Please mount a new bootstrap token at "+tokenPath) {
-		t.Errorf("expected 'Please mount a new bootstrap token' log, got: %s", output)
 	}
 }
 
@@ -329,9 +328,8 @@ func TestRenew_NoTokenPathConfigured(t *testing.T) {
 	r := NewRenewer(cfg, store, nil)
 	r.clientFactory = fakeClientFactory(fakeClient)
 
-	var buf bytes.Buffer
-	log.SetOutput(&buf)
-	defer log.SetOutput(os.Stderr)
+	buf, cleanup := captureLogs(t)
+	defer cleanup()
 
 	err := r.renew(context.Background(), "cluster-b", cfg.Clusters["cluster-b"])
 	if err == nil {
@@ -339,7 +337,7 @@ func TestRenew_NoTokenPathConfigured(t *testing.T) {
 	}
 
 	output := buf.String()
-	if !strings.Contains(output, "Please mount a new bootstrap token and set token_path") {
+	if !strings.Contains(output, "token renewal failed, set token_path") {
 		t.Errorf("expected 'set token_path' log, got: %s", output)
 	}
 }
@@ -363,9 +361,8 @@ func TestRenew_BootstrapFileNotReadable(t *testing.T) {
 	r := NewRenewer(cfg, store, nil)
 	r.clientFactory = fakeClientFactory(fakeClient)
 
-	var buf bytes.Buffer
-	log.SetOutput(&buf)
-	defer log.SetOutput(os.Stderr)
+	buf, cleanup := captureLogs(t)
+	defer cleanup()
 
 	err := r.renew(context.Background(), "cluster-b", cfg.Clusters["cluster-b"])
 	if err == nil {
@@ -373,7 +370,7 @@ func TestRenew_BootstrapFileNotReadable(t *testing.T) {
 	}
 
 	output := buf.String()
-	if !strings.Contains(output, "failed to read bootstrap token from /nonexistent/token") {
+	if !strings.Contains(output, "failed to read bootstrap token") {
 		t.Errorf("expected 'failed to read' log, got: %s", output)
 	}
 }

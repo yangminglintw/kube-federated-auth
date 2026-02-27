@@ -8,7 +8,7 @@ import (
 	"encoding/json"
 	"encoding/pem"
 	"fmt"
-	"log"
+	"log/slog"
 	"os"
 	"strings"
 	"time"
@@ -59,11 +59,11 @@ func (r *Renewer) Start(ctx context.Context) {
 }
 
 func (r *Renewer) renewLoop(ctx context.Context, cluster string, cfg config.ClusterConfig, interval time.Duration) {
-	log.Printf("Starting credential renewal loop for cluster %s (interval: %s)", cluster, interval)
+	slog.Info("starting credential renewal loop", "cluster", cluster, "interval", interval)
 
 	// Initial renewal
 	if err := r.renew(ctx, cluster, cfg); err != nil {
-		log.Printf("Initial credential renewal failed for cluster %s: %v", cluster, err)
+		slog.Error("initial credential renewal failed", "cluster", cluster, "error", err)
 	}
 
 	ticker := time.NewTicker(interval)
@@ -73,10 +73,10 @@ func (r *Renewer) renewLoop(ctx context.Context, cluster string, cfg config.Clus
 		select {
 		case <-ticker.C:
 			if err := r.renew(ctx, cluster, cfg); err != nil {
-				log.Printf("Credential renewal failed for cluster %s: %v", cluster, err)
+				slog.Error("credential renewal failed", "cluster", cluster, "error", err)
 			}
 		case <-ctx.Done():
-			log.Printf("Stopping credential renewal loop for cluster %s", cluster)
+			slog.Info("stopping credential renewal loop", "cluster", cluster)
 			return
 		}
 	}
@@ -105,33 +105,32 @@ func (r *Renewer) renew(ctx context.Context, cluster string, cfg config.ClusterC
 	if exp, err := getTokenExpiration(creds.Token); err == nil {
 		timeUntilExpiry := time.Until(exp)
 		if timeUntilExpiry > renewBefore {
-			log.Printf("Skipping renewal for cluster %s: token expires in %s (threshold: %s)",
-				cluster, timeUntilExpiry.Round(time.Minute), renewBefore)
+			slog.Info("skipping renewal", "cluster", cluster,
+				"expires_in", timeUntilExpiry.Round(time.Minute), "threshold", renewBefore)
 			return nil
 		}
-		log.Printf("Renewing credentials for cluster %s: token expires in %s (threshold: %s)",
-			cluster, timeUntilExpiry.Round(time.Minute), renewBefore)
+		slog.Info("renewing credentials", "cluster", cluster,
+			"expires_in", timeUntilExpiry.Round(time.Minute), "threshold", renewBefore)
 	} else {
-		log.Printf("Renewing credentials for cluster %s: could not determine expiration (%v)", cluster, err)
+		slog.Info("renewing credentials", "cluster", cluster, "error", err)
 	}
 
 	// Try renewal with current credentials
 	if err := r.requestNewToken(ctx, cluster, cfg, creds); err != nil {
 		// If renewal failed and bootstrap credentials are available, retry with bootstrap
 		if cfg.TokenPath != "" && cfg.CACert != "" {
-			log.Printf("Token renewal failed for cluster %s, retrying with bootstrap credentials: %v", cluster, err)
+			slog.Warn("token renewal failed, retrying with bootstrap", "cluster", cluster, "error", err)
 			if loadErr := r.credStore.LoadFromFiles(cluster, cfg.TokenPath, cfg.CACert); loadErr != nil {
-				log.Printf("ERROR: cluster %s: failed to read bootstrap token from %s: %v", cluster, cfg.TokenPath, loadErr)
+				slog.Error("failed to read bootstrap token", "cluster", cluster, "path", cfg.TokenPath, "error", loadErr)
 				return fmt.Errorf("requesting token: %w (bootstrap fallback also failed: %v)", err, loadErr)
 			}
 			bootstrapCreds, _ := r.credStore.Get(cluster)
 			if retryErr := r.requestNewToken(ctx, cluster, cfg, bootstrapCreds); retryErr != nil {
-				log.Printf("ERROR: cluster %s: bootstrap token at %s is invalid or expired: %v", cluster, cfg.TokenPath, retryErr)
-				log.Printf("ERROR: cluster %s: token renewal failed. Please mount a new bootstrap token at %s.", cluster, cfg.TokenPath)
+				slog.Error("bootstrap token is invalid or expired", "cluster", cluster, "path", cfg.TokenPath, "error", retryErr)
 				return fmt.Errorf("requesting token with bootstrap credentials: %w", retryErr)
 			}
 		} else {
-			log.Printf("ERROR: cluster %s: token renewal failed. Please mount a new bootstrap token and set token_path.", cluster)
+			slog.Error("token renewal failed, set token_path with bootstrap token", "cluster", cluster)
 			return fmt.Errorf("requesting token: %w", err)
 		}
 	}
@@ -186,8 +185,8 @@ func (r *Renewer) requestNewToken(ctx context.Context, cluster string, cfg confi
 		r.verifier.InvalidateVerifier(cluster)
 	}
 
-	log.Printf("Successfully renewed credentials for cluster %s (expires: %s)",
-		cluster, token.Status.ExpirationTimestamp.Format(time.RFC3339))
+	slog.Info("successfully renewed credentials", "cluster", cluster,
+		"expires", token.Status.ExpirationTimestamp.Format(time.RFC3339))
 
 	return nil
 }
@@ -255,13 +254,13 @@ func checkCACertExpiration(cluster string, caCertPEM []byte) {
 
 	block, _ := pem.Decode(caCertPEM)
 	if block == nil {
-		log.Printf("WARNING: cluster %s: failed to decode CA certificate PEM", cluster)
+		slog.Warn("failed to decode CA certificate PEM", "cluster", cluster)
 		return
 	}
 
 	cert, err := x509.ParseCertificate(block.Bytes)
 	if err != nil {
-		log.Printf("WARNING: cluster %s: failed to parse CA certificate: %v", cluster, err)
+		slog.Warn("failed to parse CA certificate", "cluster", cluster, "error", err)
 		return
 	}
 
@@ -269,8 +268,8 @@ func checkCACertExpiration(cluster string, caCertPEM []byte) {
 	threshold := lifetime / 5 // 20% of lifetime
 	timeUntilExpiry := time.Until(cert.NotAfter)
 	if timeUntilExpiry < threshold {
-		log.Printf("WARNING: cluster %s: CA certificate expires in %d days (%s)",
-			cluster, int(timeUntilExpiry.Hours()/24), cert.NotAfter.Format(time.RFC3339))
+		slog.Warn("CA certificate expiring soon", "cluster", cluster,
+			"days_remaining", int(timeUntilExpiry.Hours()/24), "expires", cert.NotAfter.Format(time.RFC3339))
 	}
 }
 

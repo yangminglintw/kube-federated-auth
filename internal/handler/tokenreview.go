@@ -4,7 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"log"
+	"log/slog"
 	"net/http"
 	"strings"
 
@@ -15,6 +15,7 @@ import (
 
 	"github.com/rophy/kube-federated-auth/internal/config"
 	"github.com/rophy/kube-federated-auth/internal/credentials"
+	mw "github.com/rophy/kube-federated-auth/internal/middleware"
 	"github.com/rophy/kube-federated-auth/internal/oidc"
 )
 
@@ -46,8 +47,13 @@ func (h *TokenReviewHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	// Step 0: Authenticate the caller via their own SA token
 	if h.config != nil && len(h.config.AuthorizedClients) > 0 {
-		if err := h.authenticateCaller(r); err != nil {
-			h.writeError(w, err.code, err.message)
+		caller, authErr := h.authenticateCaller(r)
+		if caller != "" {
+			*r = *r.WithContext(mw.SetCallerIdentity(r.Context(), caller))
+		}
+		if authErr != nil {
+			*r = *r.WithContext(mw.SetErrorMessage(r.Context(), authErr.message))
+			h.writeError(w, authErr.code, authErr.message)
 			return
 		}
 	}
@@ -70,19 +76,23 @@ func (h *TokenReviewHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Step 1: Detect cluster via JWKS (local, no token leakage)
-	cluster, err := h.detectCluster(r.Context(), tr.Spec.Token)
+	cluster, claims, err := h.detectCluster(r.Context(), tr.Spec.Token)
 	if err != nil {
-		log.Printf("Cluster detection failed: %v", err)
+		*r = *r.WithContext(mw.SetErrorMessage(r.Context(), "token not valid for any configured cluster"))
 		h.writeUnauthenticated(w, &tr, "token not valid for any configured cluster")
 		return
 	}
 
-	log.Printf("Detected cluster: %s", cluster)
+	// Build client identity from claims for logging
+	ns, sa := extractIdentity(claims)
+	clientIdentity := fmt.Sprintf("%s/%s/%s", cluster, ns, sa)
+	*r = *r.WithContext(mw.SetClientIdentity(r.Context(), clientIdentity))
 
 	// Step 2: Forward TokenReview to detected cluster
 	result, err := h.forwardTokenReview(r.Context(), cluster, &tr)
 	if err != nil {
-		log.Printf("TokenReview forwarding failed for cluster %s: %v", cluster, err)
+		slog.ErrorContext(r.Context(), "tokenreview forwarding failed",
+			"cluster", cluster, "error", err)
 		h.writeUnauthenticated(w, &tr, fmt.Sprintf("failed to validate token: %v", err))
 		return
 	}
@@ -109,25 +119,25 @@ func (e *authError) Error() string {
 }
 
 // authenticateCaller verifies the caller's own ServiceAccount token from the Authorization header.
-// Returns nil if the caller is authorized, or an authError with appropriate HTTP status.
-func (h *TokenReviewHandler) authenticateCaller(r *http.Request) *authError {
+// Returns the caller identity string on success, or an authError on failure.
+func (h *TokenReviewHandler) authenticateCaller(r *http.Request) (string, *authError) {
 	authHeader := r.Header.Get("Authorization")
 	if authHeader == "" {
-		return &authError{http.StatusUnauthorized, "Authorization header required"}
+		return "", &authError{http.StatusUnauthorized, "Authorization header required"}
 	}
 
 	const bearerPrefix = "Bearer "
 	if !strings.HasPrefix(authHeader, bearerPrefix) {
-		return &authError{http.StatusUnauthorized, "Authorization header must use Bearer scheme"}
+		return "", &authError{http.StatusUnauthorized, "Authorization header must use Bearer scheme"}
 	}
 
 	callerToken := strings.TrimPrefix(authHeader, bearerPrefix)
 	if callerToken == "" {
-		return &authError{http.StatusUnauthorized, "bearer token is empty"}
+		return "", &authError{http.StatusUnauthorized, "bearer token is empty"}
 	}
 
 	if h.verifier == nil {
-		return &authError{http.StatusInternalServerError, "server not configured for authentication"}
+		return "", &authError{http.StatusInternalServerError, "server not configured for authentication"}
 	}
 
 	// Verify caller's token via JWKS to find the source cluster
@@ -143,23 +153,23 @@ func (h *TokenReviewHandler) authenticateCaller(r *http.Request) *authError {
 	}
 
 	if callerClaims == nil {
-		return &authError{http.StatusUnauthorized, "caller token not valid for any configured cluster"}
+		return "", &authError{http.StatusUnauthorized, "caller token not valid for any configured cluster"}
 	}
 
 	// Extract namespace and service account from claims
 	namespace, saName := extractIdentity(callerClaims)
 	if namespace == "" || saName == "" {
-		return &authError{http.StatusUnauthorized, "caller token missing identity claims"}
+		return "", &authError{http.StatusUnauthorized, "caller token missing identity claims"}
 	}
+
+	identity := fmt.Sprintf("%s/%s/%s", callerCluster, namespace, saName)
 
 	// Check against authorized_clients whitelist
 	if !h.config.IsAuthorizedClient(callerCluster, namespace, saName) {
-		log.Printf("Unauthorized caller: %s/%s/%s", callerCluster, namespace, saName)
-		return &authError{http.StatusForbidden, fmt.Sprintf("caller %s/%s/%s is not authorized", callerCluster, namespace, saName)}
+		return identity, &authError{http.StatusForbidden, "caller is not authorized"}
 	}
 
-	log.Printf("Authorized caller: %s/%s/%s", callerCluster, namespace, saName)
-	return nil
+	return identity, nil
 }
 
 // extractIdentity extracts namespace and service account name from OIDC claims.
@@ -183,17 +193,15 @@ func extractIdentity(claims *oidc.Claims) (namespace, serviceAccount string) {
 
 // detectCluster tries to verify the token against all configured clusters using JWKS.
 // This is done locally without sending the token anywhere.
-// Returns the cluster name that successfully verified the token signature.
-func (h *TokenReviewHandler) detectCluster(ctx context.Context, token string) (string, error) {
+// Returns the cluster name and claims from the successful verification.
+func (h *TokenReviewHandler) detectCluster(ctx context.Context, token string) (string, *oidc.Claims, error) {
 	for clusterName := range h.config.Clusters {
-		_, err := h.verifier.Verify(ctx, clusterName, token)
+		claims, err := h.verifier.Verify(ctx, clusterName, token)
 		if err == nil {
-			return clusterName, nil
+			return clusterName, claims, nil
 		}
-		// Signature didn't match - try next cluster
-		log.Printf("Token not valid for cluster %s: %v", clusterName, err)
 	}
-	return "", fmt.Errorf("token signature does not match any configured cluster")
+	return "", nil, fmt.Errorf("token signature does not match any configured cluster")
 }
 
 // forwardTokenReview sends the TokenReview request to the detected cluster's API server.

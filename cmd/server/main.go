@@ -3,7 +3,7 @@ package main
 import (
 	"context"
 	"flag"
-	"log"
+	"log/slog"
 	"net/http"
 	"os"
 	"os/signal"
@@ -18,6 +18,8 @@ import (
 var Version = "dev"
 
 func main() {
+	slog.SetDefault(slog.New(slog.NewTextHandler(os.Stderr, nil)))
+
 	configPath := flag.String("config", getEnv("CONFIG_PATH", "config/clusters.yaml"), "path to cluster config file")
 	port := flag.String("port", getEnv("PORT", "8080"), "server port")
 	secretName := flag.String("secret-name", getEnv("SECRET_NAME", "kube-federated-auth"), "name of credential secret")
@@ -27,10 +29,11 @@ func main() {
 
 	cfg, err := config.Load(*configPath)
 	if err != nil {
-		log.Fatalf("Failed to load config: %v", err)
+		slog.Error("failed to load config", "error", err)
+		os.Exit(1)
 	}
 
-	log.Printf("Loaded %d cluster(s): %v", len(cfg.Clusters), cfg.ClusterNames())
+	slog.Info("config loaded", "clusters", cfg.ClusterNames(), "count", len(cfg.Clusters))
 
 	// Only create credential store if there are remote clusters
 	var credStore *credentials.Store
@@ -39,25 +42,26 @@ func main() {
 		var err error
 		credStore, err = credentials.NewStore(namespace, *secretName)
 		if err != nil {
-			log.Fatalf("Failed to create credential store: %v", err)
+			slog.Error("failed to create credential store", "error", err)
+			os.Exit(1)
 		}
 
 		// Load bootstrap credentials from files for clusters not already in the store
 		for clusterName, clusterCfg := range cfg.Clusters {
 			if clusterCfg.TokenPath != "" && clusterCfg.CACert != "" {
 				if err := credStore.LoadBootstrapFromFiles(clusterName, clusterCfg.TokenPath, clusterCfg.CACert); err != nil {
-					log.Printf("Warning: could not load bootstrap credentials for %s: %v", clusterName, err)
+					slog.Warn("could not load bootstrap credentials", "cluster", clusterName, "error", err)
 				}
 			}
 		}
 	}
 
-	log.Printf("kube-federated-auth version %s", Version)
+	slog.Info("starting server", "version", Version, "addr", ":"+*port)
 	srv := server.New(cfg, credStore, Version)
 
 	// Start credential renewal for remote clusters
 	if len(remoteClusters) > 0 {
-		log.Printf("Starting credential renewal for remote clusters: %v", remoteClusters)
+		slog.Info("starting credential renewal", "remote_clusters", remoteClusters)
 		ctx, cancel := context.WithCancel(context.Background())
 		defer cancel()
 
@@ -69,15 +73,15 @@ func main() {
 			sigCh := make(chan os.Signal, 1)
 			signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
 			<-sigCh
-			log.Println("Shutting down...")
+			slog.Info("shutting down")
 			cancel()
 		}()
 	}
 
 	addr := ":" + *port
-	log.Printf("Starting server on %s", addr)
 	if err := http.ListenAndServe(addr, srv.Handler); err != nil {
-		log.Fatalf("Server failed: %v", err)
+		slog.Error("server failed", "error", err)
+		os.Exit(1)
 	}
 }
 
