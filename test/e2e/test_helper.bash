@@ -50,6 +50,16 @@ get_unauthorized_caller_token() {
     kubectl --context "$KUBE_CONTEXT" -n "$NAMESPACE" create token default --duration=10m
 }
 
+# Run kubectl against cluster-a in the kube-federated-auth namespace
+ka() {
+    kubectl --context "$KUBE_CONTEXT" -n "$NAMESPACE" "$@"
+}
+
+# Get logs from the kube-federated-auth server pod
+server_logs() {
+    ka logs -l app=kube-federated-auth --tail=100
+}
+
 # Wait for a service to be ready (up to 30 seconds)
 wait_for_service() {
     local url="${1:-${SERVICE_URL}/health}"
