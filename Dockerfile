@@ -11,14 +11,12 @@ COPY . .
 RUN --mount=type=cache,target=/go/pkg/mod --mount=type=cache,target=/root/.cache/go-build \
     CGO_ENABLED=0 go build -ldflags "-X main.Version=${VERSION}" -o /kube-federated-auth ./cmd/server
 
-FROM alpine:3.20
-
-RUN apk --no-cache add ca-certificates bash tini curl
+FROM gcr.io/distroless/static:nonroot
 
 COPY --from=builder /kube-federated-auth /usr/local/bin/kube-federated-auth
 
 EXPOSE 8080
 
-ENTRYPOINT ["/sbin/tini", "--"]
+USER 65534:65534
 
 CMD ["kube-federated-auth"]
