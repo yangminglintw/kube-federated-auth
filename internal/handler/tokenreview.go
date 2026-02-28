@@ -32,21 +32,23 @@ type TokenVerifier interface {
 }
 
 type TokenReviewHandler struct {
-	verifier  TokenVerifier
-	config    *config.Config
-	credStore *credentials.Store
-	caches    map[string]*cache.Cache[*authv1.TokenReview]
-	clients   map[string]kubernetes.Interface
-	clientsMu sync.RWMutex
+	verifier       TokenVerifier
+	config         *config.Config
+	credStore      *credentials.Store
+	statusProvider ClusterStatusProvider
+	caches         map[string]*cache.Cache[*authv1.TokenReview]
+	clients        map[string]kubernetes.Interface
+	clientsMu      sync.RWMutex
 }
 
-func NewTokenReviewHandler(v TokenVerifier, cfg *config.Config, store *credentials.Store) *TokenReviewHandler {
+func NewTokenReviewHandler(v TokenVerifier, cfg *config.Config, store *credentials.Store, sp ClusterStatusProvider) *TokenReviewHandler {
 	h := &TokenReviewHandler{
-		verifier:  v,
-		config:    cfg,
-		credStore: store,
-		caches:    make(map[string]*cache.Cache[*authv1.TokenReview]),
-		clients:   make(map[string]kubernetes.Interface),
+		verifier:       v,
+		config:         cfg,
+		credStore:      store,
+		statusProvider: sp,
+		caches:         make(map[string]*cache.Cache[*authv1.TokenReview]),
+		clients:        make(map[string]kubernetes.Interface),
 	}
 
 	if cfg != nil {
@@ -72,8 +74,12 @@ func (h *TokenReviewHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			*r = *r.WithContext(mw.SetCallerIdentity(r.Context(), caller))
 		}
 		if authErr != nil {
+			code := authErr.code
+			if code == http.StatusUnauthorized && h.isDegraded() {
+				code = http.StatusInternalServerError
+			}
 			*r = *r.WithContext(mw.SetErrorMessage(r.Context(), authErr.message))
-			h.writeError(w, authErr.code, authErr.message)
+			h.writeError(w, code, authErr.message)
 			return
 		}
 	}
@@ -99,7 +105,11 @@ func (h *TokenReviewHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	cluster, claims, err := h.detectCluster(r.Context(), tr.Spec.Token)
 	if err != nil {
 		*r = *r.WithContext(mw.SetErrorMessage(r.Context(), "token not valid for any configured cluster"))
-		h.writeUnauthenticated(w, &tr, "token not valid for any configured cluster")
+		if h.isDegraded() {
+			h.writeError(w, http.StatusInternalServerError, "token not valid for any configured cluster")
+		} else {
+			h.writeUnauthenticated(w, &tr, "token not valid for any configured cluster")
+		}
 		return
 	}
 
@@ -362,6 +372,13 @@ func (h *TokenReviewHandler) writeUnauthenticated(w http.ResponseWriter, req *au
 	}
 
 	json.NewEncoder(w).Encode(resp)
+}
+
+func (h *TokenReviewHandler) isDegraded() bool {
+	if h.statusProvider == nil {
+		return false
+	}
+	return len(h.statusProvider.DegradedClusters()) > 0
 }
 
 func (h *TokenReviewHandler) writeError(w http.ResponseWriter, code int, msg string) {

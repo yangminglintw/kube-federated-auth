@@ -3,6 +3,7 @@ package credentials
 import (
 	"context"
 	"encoding/base64"
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"testing"
@@ -33,6 +34,66 @@ func writeTestFiles(t *testing.T, dir, token, ca string) (tokenPath, caPath stri
 		t.Fatal(err)
 	}
 	return
+}
+
+func makePodBoundJWT(sub string, exp time.Time, podName string) string {
+	header := base64.RawURLEncoding.EncodeToString([]byte(`{"alg":"none"}`))
+	claims := map[string]interface{}{
+		"sub": sub,
+		"exp": exp.Unix(),
+		"kubernetes.io": map[string]interface{}{
+			"pod": map[string]interface{}{
+				"name": podName,
+				"uid":  "test-uid",
+			},
+		},
+	}
+	claimsJSON, _ := json.Marshal(claims)
+	payload := base64.RawURLEncoding.EncodeToString(claimsJSON)
+	return header + "." + payload + ".sig"
+}
+
+func TestIsTokenPodBound(t *testing.T) {
+	t.Run("pod-bound token", func(t *testing.T) {
+		token := makePodBoundJWT("system:serviceaccount:ns:sa", time.Now().Add(time.Hour), "my-pod")
+		if !isTokenPodBound(token) {
+			t.Error("expected pod-bound token to be detected")
+		}
+	})
+	t.Run("regular token", func(t *testing.T) {
+		token := makeJWT("system:serviceaccount:ns:sa", time.Now().Add(time.Hour))
+		if isTokenPodBound(token) {
+			t.Error("expected regular token to not be detected as pod-bound")
+		}
+	})
+	t.Run("invalid JWT", func(t *testing.T) {
+		if isTokenPodBound("not-a-jwt") {
+			t.Error("expected invalid JWT to not be detected as pod-bound")
+		}
+	})
+}
+
+func TestLoadFromSecret_SkipsPodBoundTokens(t *testing.T) {
+	podBoundToken := makePodBoundJWT("system:serviceaccount:ns:sa", time.Now().Add(time.Hour), "my-pod")
+	secret := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{Name: "creds", Namespace: "test-ns"},
+		Data: map[string][]byte{
+			"cluster-a-token": []byte(podBoundToken),
+		},
+	}
+	store := newTestStore()
+	store.client = kubefake.NewSimpleClientset(secret)
+	store.namespace = "test-ns"
+	store.secretName = "creds"
+
+	err := store.loadFromSecret(context.Background())
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	_, ok := store.Get("cluster-a")
+	if ok {
+		t.Error("expected pod-bound token to be skipped")
+	}
 }
 
 func TestParseServiceAccountFromToken(t *testing.T) {

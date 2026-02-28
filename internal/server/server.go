@@ -1,6 +1,7 @@
 package server
 
 import (
+	"context"
 	"log/slog"
 	"net/http"
 
@@ -19,16 +20,17 @@ type Server struct {
 
 func New(cfg *config.Config, credStore *credentials.Store, version string) *Server {
 	verifier := oidc.NewVerifierManager(cfg, credStore)
+	verifier.WarmUp(context.Background())
 	logged := mw.RequestLogger(slog.Default())
 
 	mux := http.NewServeMux()
 
 	// Health endpoint without request logging to avoid spam from probes
-	mux.Handle("GET /health", handler.NewHealthHandler(version))
+	mux.Handle("GET /health", handler.NewHealthHandler(version, verifier))
 
 	// Routes with slog-based request logging
 	mux.Handle("GET /clusters", logged(handler.NewClustersHandler(cfg, credStore)))
-	mux.Handle("POST /apis/authentication.k8s.io/v1/tokenreviews", logged(handler.NewTokenReviewHandler(verifier, cfg, credStore)))
+	mux.Handle("POST /apis/authentication.k8s.io/v1/tokenreviews", logged(handler.NewTokenReviewHandler(verifier, cfg, credStore, verifier)))
 
 	return &Server{
 		Handler:  mw.Recoverer(mux),

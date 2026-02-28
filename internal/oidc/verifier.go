@@ -31,20 +31,49 @@ type Claims struct {
 }
 
 type VerifierManager struct {
-	mu           sync.RWMutex
-	verifiers    map[string]*oidc.IDTokenVerifier
-	kidToCluster map[string]string // kid → clusterName
-	config       *config.Config
-	credStore    *credentials.Store
+	mu              sync.RWMutex
+	verifiers       map[string]*oidc.IDTokenVerifier
+	kidToCluster    map[string]string // kid → clusterName
+	degraded        map[string]string // cluster → error message
+	config          *config.Config
+	credStore       *credentials.Store
+	testHTTPClients map[string]*http.Client // for testing only
 }
 
 func NewVerifierManager(cfg *config.Config, credStore *credentials.Store) *VerifierManager {
 	return &VerifierManager{
 		verifiers:    make(map[string]*oidc.IDTokenVerifier),
 		kidToCluster: make(map[string]string),
+		degraded:     make(map[string]string),
 		config:       cfg,
 		credStore:    credStore,
 	}
+}
+
+// WarmUp eagerly creates verifiers for all configured clusters.
+// Failures are recorded as degraded and logged, but do not prevent startup.
+func (m *VerifierManager) WarmUp(ctx context.Context) {
+	for name, cfg := range m.config.Clusters {
+		if _, err := m.getOrCreateVerifier(ctx, name, cfg); err != nil {
+			slog.Error("warmup: failed to create verifier", "cluster", name, "error", err)
+		} else {
+			slog.Info("warmup: verifier ready", "cluster", name)
+		}
+	}
+}
+
+// DegradedClusters returns a copy of the degraded clusters map.
+func (m *VerifierManager) DegradedClusters() map[string]string {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	if len(m.degraded) == 0 {
+		return nil
+	}
+	result := make(map[string]string, len(m.degraded))
+	for k, v := range m.degraded {
+		result[k] = v
+	}
+	return result
 }
 
 // InvalidateVerifier removes a cached verifier, forcing recreation with new credentials
@@ -202,6 +231,9 @@ func (m *VerifierManager) getOrCreateVerifier(ctx context.Context, name string, 
 
 	httpClient, err := m.createHTTPClient(name, cfg)
 	if err != nil {
+		errMsg := err.Error()
+		slog.Error("failed to create HTTP client for OIDC verifier", "cluster", name, "error", err)
+		m.degraded[name] = errMsg
 		return nil, err
 	}
 
@@ -212,7 +244,10 @@ func (m *VerifierManager) getOrCreateVerifier(ctx context.Context, name string, 
 	// Fetch OIDC discovery document from the discovery URL
 	discovery, err := m.fetchDiscovery(ctx, httpClient, discoveryURL)
 	if err != nil {
-		return nil, fmt.Errorf("fetching OIDC discovery from %s: %w", discoveryURL, err)
+		errMsg := fmt.Sprintf("fetching OIDC discovery from %s: %v", discoveryURL, err)
+		slog.Error("OIDC verifier creation failed", "cluster", name, "error", errMsg)
+		m.degraded[name] = errMsg
+		return nil, fmt.Errorf("%s", errMsg)
 	}
 
 	// Create a remote key set that fetches JWKS from the discovery URL's JWKS endpoint
@@ -243,6 +278,7 @@ func (m *VerifierManager) getOrCreateVerifier(ctx context.Context, name string, 
 	})
 
 	m.verifiers[name] = verifier
+	delete(m.degraded, name) // Recovery: clear degraded state on success
 	return verifier, nil
 }
 
@@ -292,6 +328,13 @@ func rewriteJWKSURL(jwksURL, apiServer string) string {
 }
 
 func (m *VerifierManager) createHTTPClient(clusterName string, cfg config.ClusterConfig) (*http.Client, error) {
+	// Test hook: use injected client if available
+	if m.testHTTPClients != nil {
+		if c, ok := m.testHTTPClients[clusterName]; ok {
+			return c, nil
+		}
+	}
+
 	var transport http.RoundTripper = http.DefaultTransport
 
 	var caCert []byte

@@ -200,6 +200,58 @@ func TestRewriteJWKSURL(t *testing.T) {
 	}
 }
 
+func TestWarmUp(t *testing.T) {
+	// Serve OIDC discovery + JWKS for cluster-a, return 401 for cluster-b
+	srvA := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/.well-known/openid-configuration":
+			fmt.Fprintf(w, `{"issuer":"https://a.example.com","jwks_uri":"%s/jwks"}`, "https://"+r.Host)
+		case "/jwks":
+			fmt.Fprint(w, `{"keys":[{"kid":"a1","kty":"RSA"}]}`)
+		default:
+			w.WriteHeader(404)
+		}
+	}))
+	defer srvA.Close()
+
+	srvB := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(401)
+		fmt.Fprint(w, `{"message":"Unauthorized"}`)
+	}))
+	defer srvB.Close()
+
+	cfg := &config.Config{
+		Clusters: map[string]config.ClusterConfig{
+			"cluster-a": {Issuer: "https://a.example.com", APIServer: srvA.URL},
+			"cluster-b": {Issuer: "https://b.example.com", APIServer: srvB.URL},
+		},
+	}
+	mgr := NewVerifierManager(cfg, nil)
+	// Inject TLS clients so the test servers' certs are trusted
+	mgr.testHTTPClients = map[string]*http.Client{
+		"cluster-a": srvA.Client(),
+		"cluster-b": srvB.Client(),
+	}
+
+	mgr.WarmUp(context.Background())
+
+	// cluster-a should be healthy
+	if _, ok := mgr.verifiers["cluster-a"]; !ok {
+		t.Error("expected verifier for cluster-a after warmup")
+	}
+
+	// cluster-b should be degraded
+	degraded := mgr.DegradedClusters()
+	if degraded == nil || degraded["cluster-b"] == "" {
+		t.Error("expected cluster-b to be degraded after warmup")
+	}
+
+	// cluster-a should not be degraded
+	if _, ok := degraded["cluster-a"]; ok {
+		t.Error("expected cluster-a to not be degraded")
+	}
+}
+
 // makeJWTHeader encodes a JSON object as a base64url JWT header segment.
 func makeJWTHeader(header map[string]any) string {
 	b, _ := json.Marshal(header)

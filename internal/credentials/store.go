@@ -122,6 +122,26 @@ func NewStore(cfg *config.Config, secretName string) (*Store, error) {
 		}
 	}
 
+	// Fallback: if any cluster still has no token, try the pod's own SA token
+	const podTokenPath = "/var/run/secrets/kubernetes.io/serviceaccount/token"
+	for clusterName := range cfg.Clusters {
+		if existing, ok := s.credentials[clusterName]; ok && existing.Token != "" {
+			continue
+		}
+		token, err := os.ReadFile(podTokenPath)
+		if err != nil {
+			slog.Warn("cluster has no credentials and pod token not available",
+				"cluster", clusterName, "error", err)
+			continue
+		}
+		slog.Warn("cluster has no credentials, falling back to pod-mounted token",
+			"cluster", clusterName)
+		s.SetToken(clusterName, string(token))
+		s.mu.Lock()
+		s.credentials[clusterName].source = tokenMounted
+		s.mu.Unlock()
+	}
+
 	return s, nil
 }
 
@@ -387,6 +407,11 @@ func (s *Store) loadFromSecret(ctx context.Context) error {
 			slog.Warn("secret key has empty token", "key", key)
 			continue
 		}
+		if isTokenPodBound(token) {
+			slog.Error("skipping pod-bound token from secret (will use bootstrap token instead)",
+				"key", key, "cluster", cluster)
+			continue
+		}
 		exp, err := getTokenExpiration(token)
 		if err != nil {
 			slog.Warn("secret key has invalid token", "key", key, "error", err)
@@ -452,6 +477,32 @@ func detectNamespace() string {
 		return string(ns)
 	}
 	return "kube-federated-auth"
+}
+
+// isTokenPodBound checks if a JWT token is bound to a specific pod.
+// Pod-bound tokens contain a "kubernetes.io" claim with a "pod" field,
+// and become invalid when that pod is deleted.
+func isTokenPodBound(token string) bool {
+	parts := strings.Split(token, ".")
+	if len(parts) != 3 {
+		return false
+	}
+
+	payload, err := base64.RawURLEncoding.DecodeString(parts[1])
+	if err != nil {
+		return false
+	}
+
+	var claims struct {
+		Kubernetes struct {
+			Pod *json.RawMessage `json:"pod"`
+		} `json:"kubernetes.io"`
+	}
+	if err := json.Unmarshal(payload, &claims); err != nil {
+		return false
+	}
+
+	return claims.Kubernetes.Pod != nil
 }
 
 // parseServiceAccountFromToken extracts namespace and service account name from JWT token.

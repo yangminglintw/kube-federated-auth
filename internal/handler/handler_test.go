@@ -39,7 +39,7 @@ func (m *mockVerifier) Verify(ctx context.Context, clusterName, rawToken string)
 }
 
 func TestHealth(t *testing.T) {
-	handler := NewHealthHandler("v1.2.3")
+	handler := NewHealthHandler("v1.2.3", nil)
 
 	req := httptest.NewRequest(http.MethodGet, "/health", nil)
 	w := httptest.NewRecorder()
@@ -61,6 +61,99 @@ func TestHealth(t *testing.T) {
 
 	if resp.Version != "v1.2.3" {
 		t.Errorf("version = %q, want %q", resp.Version, "v1.2.3")
+	}
+}
+
+// mockStatusProvider implements ClusterStatusProvider for testing.
+type mockStatusProvider struct {
+	degraded map[string]string
+}
+
+func (m *mockStatusProvider) DegradedClusters() map[string]string {
+	return m.degraded
+}
+
+func TestHealth_Degraded(t *testing.T) {
+	provider := &mockStatusProvider{
+		degraded: map[string]string{"cluster-a": "OIDC discovery failed"},
+	}
+	handler := NewHealthHandler("v1.0.0", provider)
+
+	req := httptest.NewRequest(http.MethodGet, "/health", nil)
+	w := httptest.NewRecorder()
+	handler.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Errorf("status = %d, want %d", w.Code, http.StatusOK)
+	}
+
+	var resp HealthResponse
+	json.Unmarshal(w.Body.Bytes(), &resp)
+	if resp.Status != "degraded" {
+		t.Errorf("status = %q, want %q", resp.Status, "degraded")
+	}
+	if resp.Clusters["cluster-a"] != "OIDC discovery failed" {
+		t.Errorf("clusters[cluster-a] = %q, want %q", resp.Clusters["cluster-a"], "OIDC discovery failed")
+	}
+}
+
+func TestTokenReview_500WhenDegraded_CallerAuth(t *testing.T) {
+	cfg := &config.Config{
+		AuthorizedClients: []string{"cluster-a/default/my-app"},
+		Clusters: map[string]config.ClusterConfig{
+			"cluster-a": {Issuer: "https://a.example.com"},
+		},
+	}
+	verifier := &mockVerifier{claims: map[string]*oidc.Claims{}}
+	provider := &mockStatusProvider{
+		degraded: map[string]string{"cluster-a": "OIDC discovery failed"},
+	}
+	handler := NewTokenReviewHandler(verifier, cfg, nil, provider)
+
+	body := `{"apiVersion":"authentication.k8s.io/v1","kind":"TokenReview","spec":{"token":"some-token"}}`
+	req := httptest.NewRequest(http.MethodPost, "/apis/authentication.k8s.io/v1/tokenreviews", strings.NewReader(body))
+	req.Header.Set("Authorization", "Bearer invalid-token")
+	w := httptest.NewRecorder()
+
+	handler.ServeHTTP(w, req)
+
+	if w.Code != http.StatusInternalServerError {
+		t.Errorf("status = %d, want %d", w.Code, http.StatusInternalServerError)
+	}
+}
+
+func TestTokenReview_500WhenDegraded_DetectCluster(t *testing.T) {
+	verifier := &mockVerifier{
+		claims: map[string]*oidc.Claims{
+			"caller-token": {
+				Subject: "system:serviceaccount:default:my-app",
+				Kubernetes: map[string]any{
+					"namespace":      "default",
+					"serviceaccount": map[string]any{"name": "my-app"},
+				},
+			},
+		},
+	}
+	cfg := &config.Config{
+		AuthorizedClients: []string{"*/*/*"},
+		Clusters: map[string]config.ClusterConfig{
+			"cluster-a": {Issuer: "https://a.example.com"},
+		},
+	}
+	provider := &mockStatusProvider{
+		degraded: map[string]string{"cluster-b": "OIDC discovery failed"},
+	}
+	handler := NewTokenReviewHandler(verifier, cfg, nil, provider)
+
+	body := `{"apiVersion":"authentication.k8s.io/v1","kind":"TokenReview","spec":{"token":"unknown-token"}}`
+	req := httptest.NewRequest(http.MethodPost, "/apis/authentication.k8s.io/v1/tokenreviews", strings.NewReader(body))
+	req.Header.Set("Authorization", "Bearer caller-token")
+	w := httptest.NewRecorder()
+
+	handler.ServeHTTP(w, req)
+
+	if w.Code != http.StatusInternalServerError {
+		t.Errorf("status = %d, want %d", w.Code, http.StatusInternalServerError)
 	}
 }
 
@@ -106,7 +199,7 @@ func TestClusters(t *testing.T) {
 }
 
 func TestTokenReview_InvalidJSON(t *testing.T) {
-	handler := NewTokenReviewHandler(nil, nil, nil)
+	handler := NewTokenReviewHandler(nil, nil, nil, nil)
 
 	req := httptest.NewRequest(http.MethodPost, "/apis/authentication.k8s.io/v1/tokenreviews", strings.NewReader("not json"))
 	w := httptest.NewRecorder()
@@ -131,7 +224,7 @@ func TestTokenReview_InvalidJSON(t *testing.T) {
 }
 
 func TestTokenReview_MissingToken(t *testing.T) {
-	handler := NewTokenReviewHandler(nil, nil, nil)
+	handler := NewTokenReviewHandler(nil, nil, nil, nil)
 
 	body := `{"apiVersion":"authentication.k8s.io/v1","kind":"TokenReview","spec":{}}`
 	req := httptest.NewRequest(http.MethodPost, "/apis/authentication.k8s.io/v1/tokenreviews", strings.NewReader(body))
@@ -157,7 +250,7 @@ func TestTokenReview_MissingToken(t *testing.T) {
 }
 
 func TestTokenReview_NotConfigured(t *testing.T) {
-	handler := NewTokenReviewHandler(nil, nil, nil)
+	handler := NewTokenReviewHandler(nil, nil, nil, nil)
 
 	body := `{"apiVersion":"authentication.k8s.io/v1","kind":"TokenReview","spec":{"token":"test-token"}}`
 	req := httptest.NewRequest(http.MethodPost, "/apis/authentication.k8s.io/v1/tokenreviews", strings.NewReader(body))
@@ -184,7 +277,7 @@ func TestTokenReview_NotConfigured(t *testing.T) {
 }
 
 func TestTokenReview_ResponseFormat(t *testing.T) {
-	handler := NewTokenReviewHandler(nil, nil, nil)
+	handler := NewTokenReviewHandler(nil, nil, nil, nil)
 
 	body := `{"apiVersion":"authentication.k8s.io/v1","kind":"TokenReview","spec":{"token":"invalid-token"}}`
 	req := httptest.NewRequest(http.MethodPost, "/apis/authentication.k8s.io/v1/tokenreviews", strings.NewReader(body))
@@ -222,7 +315,7 @@ func TestTokenReview_NoAuthHeader_WithAuthorizedClients(t *testing.T) {
 		},
 	}
 	verifier := &mockVerifier{claims: map[string]*oidc.Claims{}}
-	handler := NewTokenReviewHandler(verifier, cfg, nil)
+	handler := NewTokenReviewHandler(verifier, cfg, nil, nil)
 
 	body := `{"apiVersion":"authentication.k8s.io/v1","kind":"TokenReview","spec":{"token":"some-token"}}`
 	req := httptest.NewRequest(http.MethodPost, "/apis/authentication.k8s.io/v1/tokenreviews", strings.NewReader(body))
@@ -243,7 +336,7 @@ func TestTokenReview_InvalidCallerToken(t *testing.T) {
 		},
 	}
 	verifier := &mockVerifier{claims: map[string]*oidc.Claims{}}
-	handler := NewTokenReviewHandler(verifier, cfg, nil)
+	handler := NewTokenReviewHandler(verifier, cfg, nil, nil)
 
 	body := `{"apiVersion":"authentication.k8s.io/v1","kind":"TokenReview","spec":{"token":"some-token"}}`
 	req := httptest.NewRequest(http.MethodPost, "/apis/authentication.k8s.io/v1/tokenreviews", strings.NewReader(body))
@@ -277,7 +370,7 @@ func TestTokenReview_ValidCallerButNotWhitelisted(t *testing.T) {
 			},
 		},
 	}
-	handler := NewTokenReviewHandler(verifier, cfg, nil)
+	handler := NewTokenReviewHandler(verifier, cfg, nil, nil)
 
 	body := `{"apiVersion":"authentication.k8s.io/v1","kind":"TokenReview","spec":{"token":"some-token"}}`
 	req := httptest.NewRequest(http.MethodPost, "/apis/authentication.k8s.io/v1/tokenreviews", strings.NewReader(body))
@@ -298,7 +391,7 @@ func TestTokenReview_NoAuthorizedClients_SkipsAuth(t *testing.T) {
 			"cluster-a": {Issuer: "https://a.example.com"},
 		},
 	}
-	handler := NewTokenReviewHandler(nil, cfg, nil)
+	handler := NewTokenReviewHandler(nil, cfg, nil, nil)
 
 	body := `{"apiVersion":"authentication.k8s.io/v1","kind":"TokenReview","spec":{"token":"some-token"}}`
 	req := httptest.NewRequest(http.MethodPost, "/apis/authentication.k8s.io/v1/tokenreviews", strings.NewReader(body))
@@ -326,7 +419,7 @@ func TestTokenReview_AuthHeaderNotBearer(t *testing.T) {
 			"cluster-a": {Issuer: "https://a.example.com"},
 		},
 	}
-	handler := NewTokenReviewHandler(&mockVerifier{}, cfg, nil)
+	handler := NewTokenReviewHandler(&mockVerifier{}, cfg, nil, nil)
 
 	body := `{"apiVersion":"authentication.k8s.io/v1","kind":"TokenReview","spec":{"token":"some-token"}}`
 	req := httptest.NewRequest(http.MethodPost, "/apis/authentication.k8s.io/v1/tokenreviews", strings.NewReader(body))
@@ -398,7 +491,7 @@ func TestTokenReviewHandler_CacheConstructedFromConfig(t *testing.T) {
 			},
 		},
 	}
-	h := NewTokenReviewHandler(nil, cfg, nil)
+	h := NewTokenReviewHandler(nil, cfg, nil, nil)
 
 	if _, ok := h.caches["cluster-a"]; !ok {
 		t.Error("expected cache for cluster-a")
@@ -414,7 +507,7 @@ func TestTokenReviewHandler_CacheDisabledByDefault(t *testing.T) {
 			"cluster-a": {Issuer: "https://a.example.com"},
 		},
 	}
-	h := NewTokenReviewHandler(nil, cfg, nil)
+	h := NewTokenReviewHandler(nil, cfg, nil, nil)
 
 	if len(h.caches) != 0 {
 		t.Errorf("expected no caches when cache not configured, got %d", len(h.caches))
@@ -547,7 +640,7 @@ func TestDetectCluster(t *testing.T) {
 			"cluster-b": {Issuer: "https://b.example.com"},
 		},
 	}
-	h := NewTokenReviewHandler(verifier, cfg, nil)
+	h := NewTokenReviewHandler(verifier, cfg, nil, nil)
 
 	t.Run("token matches one cluster", func(t *testing.T) {
 		cluster, claims, err := h.detectCluster(context.Background(), "token-for-a")
@@ -589,7 +682,7 @@ func TestTokenReview_TokenNotValidForAnyClusters(t *testing.T) {
 			"cluster-a": {Issuer: "https://a.example.com"},
 		},
 	}
-	handler := NewTokenReviewHandler(verifier, cfg, nil)
+	handler := NewTokenReviewHandler(verifier, cfg, nil, nil)
 
 	body := `{"apiVersion":"authentication.k8s.io/v1","kind":"TokenReview","spec":{"token":"review-token-invalid"}}`
 	req := httptest.NewRequest(http.MethodPost, "/apis/authentication.k8s.io/v1/tokenreviews", strings.NewReader(body))
@@ -619,7 +712,7 @@ func TestBuildRESTConfig(t *testing.T) {
 		// Set CA via the exported method that exists - use the test helper
 		store.SetCACert("remote", []byte("ca-data"))
 
-		h := NewTokenReviewHandler(nil, nil, store)
+		h := NewTokenReviewHandler(nil, nil, store, nil)
 		cfg := config.ClusterConfig{
 			APIServer: "https://remote-api:6443",
 			Issuer:    "https://issuer.example.com",
@@ -641,7 +734,7 @@ func TestBuildRESTConfig(t *testing.T) {
 	})
 	t.Run("remote no credentials", func(t *testing.T) {
 		store := newTestCredStore(t)
-		h := NewTokenReviewHandler(nil, nil, store)
+		h := NewTokenReviewHandler(nil, nil, store, nil)
 		cfg := config.ClusterConfig{
 			APIServer: "https://remote-api:6443",
 		}
@@ -657,7 +750,7 @@ func TestBuildRESTConfig(t *testing.T) {
 	t.Run("qps and burst applied", func(t *testing.T) {
 		store := newTestCredStore(t)
 		store.SetToken("remote", "my-token")
-		h := NewTokenReviewHandler(nil, nil, store)
+		h := NewTokenReviewHandler(nil, nil, store, nil)
 		cfg := config.ClusterConfig{
 			APIServer: "https://remote-api:6443",
 			QPS:       100,
@@ -677,7 +770,7 @@ func TestBuildRESTConfig(t *testing.T) {
 	})
 	t.Run("qps and burst default to zero when unset", func(t *testing.T) {
 		store := newTestCredStore(t)
-		h := NewTokenReviewHandler(nil, nil, store)
+		h := NewTokenReviewHandler(nil, nil, store, nil)
 		cfg := config.ClusterConfig{
 			APIServer: "https://remote-api:6443",
 		}
@@ -694,7 +787,7 @@ func TestBuildRESTConfig(t *testing.T) {
 		}
 	})
 	t.Run("no api_server falls back to issuer", func(t *testing.T) {
-		h := NewTokenReviewHandler(nil, nil, nil)
+		h := NewTokenReviewHandler(nil, nil, nil, nil)
 		cfg := config.ClusterConfig{
 			Issuer: "https://issuer.example.com",
 		}
