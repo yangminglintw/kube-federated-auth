@@ -9,6 +9,7 @@ import (
 func newTestStore() *Store {
 	return &Store{
 		credentials: make(map[string]*Credentials),
+		managed:     make(map[string]bool),
 	}
 }
 

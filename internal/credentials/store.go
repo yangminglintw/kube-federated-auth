@@ -26,6 +26,7 @@ type Credentials struct {
 type Store struct {
 	mu          sync.RWMutex
 	credentials map[string]*Credentials
+	managed     map[string]bool // clusters whose tokens should be persisted to Secret
 	client      kubernetes.Interface
 	namespace   string
 	secretName  string
@@ -36,6 +37,7 @@ type Store struct {
 func NewStore(namespace, secretName string) (*Store, error) {
 	s := &Store{
 		credentials: make(map[string]*Credentials),
+		managed:     make(map[string]bool),
 		namespace:   namespace,
 		secretName:  secretName,
 	}
@@ -75,6 +77,7 @@ func (s *Store) Get(cluster string) (*Credentials, bool) {
 func (s *Store) Set(ctx context.Context, cluster string, creds *Credentials) error {
 	s.mu.Lock()
 	s.credentials[cluster] = creds
+	s.managed[cluster] = true
 	s.mu.Unlock()
 
 	// Persist to Secret if we have a client
@@ -131,6 +134,7 @@ func (s *Store) loadFromSecret(ctx context.Context) error {
 		s.credentials[cluster] = &Credentials{
 			Token: token,
 		}
+		s.managed[cluster] = true
 	}
 
 	return nil
@@ -145,6 +149,9 @@ func (s *Store) saveToSecret(ctx context.Context) error {
 	s.mu.RLock()
 	data := make(map[string][]byte)
 	for cluster, creds := range s.credentials {
+		if !s.managed[cluster] {
+			continue
+		}
 		data[fmt.Sprintf("%s-token", cluster)] = []byte(creds.Token)
 	}
 	s.mu.RUnlock()
