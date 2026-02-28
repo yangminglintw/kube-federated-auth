@@ -4,9 +4,11 @@ import (
 	"context"
 	"crypto/tls"
 	"crypto/x509"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
 	"os"
 	"strings"
@@ -29,17 +31,19 @@ type Claims struct {
 }
 
 type VerifierManager struct {
-	mu        sync.RWMutex
-	verifiers map[string]*oidc.IDTokenVerifier
-	config    *config.Config
-	credStore *credentials.Store
+	mu           sync.RWMutex
+	verifiers    map[string]*oidc.IDTokenVerifier
+	kidToCluster map[string]string // kid → clusterName
+	config       *config.Config
+	credStore    *credentials.Store
 }
 
 func NewVerifierManager(cfg *config.Config, credStore *credentials.Store) *VerifierManager {
 	return &VerifierManager{
-		verifiers: make(map[string]*oidc.IDTokenVerifier),
-		config:    cfg,
-		credStore: credStore,
+		verifiers:    make(map[string]*oidc.IDTokenVerifier),
+		kidToCluster: make(map[string]string),
+		config:       cfg,
+		credStore:    credStore,
 	}
 }
 
@@ -48,12 +52,29 @@ func (m *VerifierManager) InvalidateVerifier(clusterName string) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	delete(m.verifiers, clusterName)
+	for kid, owner := range m.kidToCluster {
+		if owner == clusterName {
+			delete(m.kidToCluster, kid)
+		}
+	}
 }
 
 func (m *VerifierManager) Verify(ctx context.Context, clusterName, rawToken string) (*Claims, error) {
 	clusterCfg, ok := m.config.Clusters[clusterName]
 	if !ok {
 		return nil, fmt.Errorf("cluster not found: %s", clusterName)
+	}
+
+	// KID-based short-circuit: skip go-oidc verification if the token's kid
+	// is known to belong to a different cluster
+	kid := extractKID(rawToken)
+	if kid != "" {
+		m.mu.RLock()
+		owner, known := m.kidToCluster[kid]
+		m.mu.RUnlock()
+		if known && owner != clusterName {
+			return nil, fmt.Errorf("kid %q belongs to cluster %s, not %s", kid, owner, clusterName)
+		}
 	}
 
 	verifier, err := m.getOrCreateVerifier(ctx, clusterName, clusterCfg)
@@ -64,6 +85,15 @@ func (m *VerifierManager) Verify(ctx context.Context, clusterName, rawToken stri
 	token, err := verifier.Verify(ctx, rawToken)
 	if err != nil {
 		return nil, fmt.Errorf("verifying token: %w", err)
+	}
+
+	// After successful verification, learn the kid→cluster mapping
+	if kid != "" {
+		m.mu.Lock()
+		if _, known := m.kidToCluster[kid]; !known {
+			m.kidToCluster[kid] = clusterName
+		}
+		m.mu.Unlock()
 	}
 
 	var rawClaims struct {
@@ -88,6 +118,64 @@ func (m *VerifierManager) Verify(ctx context.Context, clusterName, rawToken stri
 		NotBefore:  rawClaims.NotBefore,
 		Kubernetes: rawClaims.Kubernetes,
 	}, nil
+}
+
+// extractKID extracts the "kid" (Key ID) from a JWT header without performing
+// any cryptographic verification. Returns "" if the token is malformed or has no kid.
+func extractKID(rawToken string) string {
+	parts := strings.SplitN(rawToken, ".", 3)
+	if len(parts) < 2 {
+		return ""
+	}
+	headerBytes, err := base64.RawURLEncoding.DecodeString(parts[0])
+	if err != nil {
+		return ""
+	}
+	var header struct {
+		KID string `json:"kid"`
+	}
+	if err := json.Unmarshal(headerBytes, &header); err != nil {
+		return ""
+	}
+	return header.KID
+}
+
+// jwksResponse represents the minimal structure of a JWKS endpoint response.
+type jwksResponse struct {
+	Keys []struct {
+		KID string `json:"kid"`
+	} `json:"keys"`
+}
+
+// fetchKIDs fetches the JWKS URL and returns all kid values from the key set.
+func fetchKIDs(ctx context.Context, client *http.Client, jwksURL string) ([]string, error) {
+	req, err := http.NewRequestWithContext(ctx, "GET", jwksURL, nil)
+	if err != nil {
+		return nil, fmt.Errorf("creating JWKS request: %w", err)
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("fetching JWKS: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		return nil, fmt.Errorf("JWKS returned status %d: %s", resp.StatusCode, string(body))
+	}
+
+	var jwks jwksResponse
+	if err := json.NewDecoder(resp.Body).Decode(&jwks); err != nil {
+		return nil, fmt.Errorf("decoding JWKS: %w", err)
+	}
+
+	var kids []string
+	for _, key := range jwks.Keys {
+		if key.KID != "" {
+			kids = append(kids, key.KID)
+		}
+	}
+	return kids, nil
 }
 
 // oidcDiscovery represents the OIDC discovery document
@@ -133,6 +221,17 @@ func (m *VerifierManager) getOrCreateVerifier(ctx context.Context, name string, 
 	if cfg.APIServer != "" {
 		// Rewrite JWKS URL to use the API server instead of the internal issuer hostname
 		jwksURL = rewriteJWKSURL(discovery.JWKSURL, cfg.APIServer)
+	}
+
+	// Pre-fetch KIDs from JWKS to enable kid-based short-circuit optimization
+	kids, err := fetchKIDs(ctx, httpClient, jwksURL)
+	if err != nil {
+		slog.Warn("failed to pre-fetch KIDs (optimization disabled for this cluster)",
+			"cluster", name, "error", err)
+	} else {
+		for _, kid := range kids {
+			m.kidToCluster[kid] = name
+		}
 	}
 
 	ctx = oidc.ClientContext(ctx, httpClient)
