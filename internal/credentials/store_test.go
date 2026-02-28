@@ -1,9 +1,16 @@
 package credentials
 
 import (
+	"context"
+	"encoding/base64"
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
+
+	corev1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	kubefake "k8s.io/client-go/kubernetes/fake"
 
 	"github.com/rophy/kube-federated-auth/internal/config"
 )
@@ -28,9 +35,286 @@ func writeTestFiles(t *testing.T, dir, token, ca string) (tokenPath, caPath stri
 	return
 }
 
+func TestParseServiceAccountFromToken(t *testing.T) {
+	tests := []struct {
+		name    string
+		token   string
+		wantNS  string
+		wantSA  string
+		wantErr bool
+	}{
+		{
+			name:   "valid token",
+			token:  makeJWT("system:serviceaccount:my-ns:my-sa", time.Now().Add(time.Hour)),
+			wantNS: "my-ns",
+			wantSA: "my-sa",
+		},
+		{
+			name:    "invalid JWT format",
+			token:   "not-a-jwt",
+			wantErr: true,
+		},
+		{
+			name:    "invalid base64",
+			token:   "header.!!!invalid!!!.sig",
+			wantErr: true,
+		},
+		{
+			name:    "wrong subject format",
+			token:   makeJWT("just-a-user", time.Now().Add(time.Hour)),
+			wantErr: true,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ns, sa, err := parseServiceAccountFromToken(tt.token)
+			if tt.wantErr {
+				if err == nil {
+					t.Error("expected error, got nil")
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if ns != tt.wantNS {
+				t.Errorf("namespace = %q, want %q", ns, tt.wantNS)
+			}
+			if sa != tt.wantSA {
+				t.Errorf("serviceAccount = %q, want %q", sa, tt.wantSA)
+			}
+		})
+	}
+}
+
+func TestGetTokenExpiration(t *testing.T) {
+	t.Run("valid token", func(t *testing.T) {
+		exp := time.Now().Add(24 * time.Hour).Truncate(time.Second)
+		token := makeJWT("sub", exp)
+		got, err := getTokenExpiration(token)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if !got.Equal(exp) {
+			t.Errorf("expiration = %v, want %v", got, exp)
+		}
+	})
+	t.Run("invalid JWT", func(t *testing.T) {
+		_, err := getTokenExpiration("not-a-jwt")
+		if err == nil {
+			t.Error("expected error for invalid JWT")
+		}
+	})
+	t.Run("no exp claim", func(t *testing.T) {
+		header := base64.RawURLEncoding.EncodeToString([]byte(`{"alg":"none"}`))
+		payload := base64.RawURLEncoding.EncodeToString([]byte(`{"sub":"foo"}`))
+		token := header + "." + payload + ".sig"
+		_, err := getTokenExpiration(token)
+		if err == nil {
+			t.Error("expected error for missing exp")
+		}
+	})
+}
+
+func TestLoadFromSecret(t *testing.T) {
+	validToken := makeJWT("system:serviceaccount:ns:sa", time.Now().Add(24*time.Hour))
+
+	t.Run("nil client is no-op", func(t *testing.T) {
+		store := newTestStore()
+		// client is nil by default
+		err := store.loadFromSecret(context.Background())
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+	})
+	t.Run("secret not found is no error", func(t *testing.T) {
+		store := newTestStore()
+		store.client = kubefake.NewSimpleClientset()
+		store.namespace = "test-ns"
+		store.secretName = "nonexistent"
+
+		err := store.loadFromSecret(context.Background())
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+	})
+	t.Run("secret with valid tokens", func(t *testing.T) {
+		secret := &corev1.Secret{
+			ObjectMeta: metav1.ObjectMeta{Name: "creds", Namespace: "test-ns"},
+			Data: map[string][]byte{
+				"cluster-b-token": []byte(validToken),
+			},
+		}
+		store := newTestStore()
+		store.client = kubefake.NewSimpleClientset(secret)
+		store.namespace = "test-ns"
+		store.secretName = "creds"
+
+		err := store.loadFromSecret(context.Background())
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		creds, ok := store.Get("cluster-b")
+		if !ok {
+			t.Fatal("expected credentials for cluster-b")
+		}
+		if creds.Token != validToken {
+			t.Error("token mismatch")
+		}
+		if creds.source != tokenPersisted {
+			t.Errorf("source = %d, want tokenPersisted", creds.source)
+		}
+	})
+	t.Run("empty token skipped", func(t *testing.T) {
+		secret := &corev1.Secret{
+			ObjectMeta: metav1.ObjectMeta{Name: "creds", Namespace: "test-ns"},
+			Data: map[string][]byte{
+				"cluster-b-token": []byte(""),
+			},
+		}
+		store := newTestStore()
+		store.client = kubefake.NewSimpleClientset(secret)
+		store.namespace = "test-ns"
+		store.secretName = "creds"
+
+		store.loadFromSecret(context.Background())
+		_, ok := store.Get("cluster-b")
+		if ok {
+			t.Error("expected empty token to be skipped")
+		}
+	})
+	t.Run("key without -token suffix skipped", func(t *testing.T) {
+		secret := &corev1.Secret{
+			ObjectMeta: metav1.ObjectMeta{Name: "creds", Namespace: "test-ns"},
+			Data: map[string][]byte{
+				"cluster-b-ca": []byte("some-ca-data"),
+			},
+		}
+		store := newTestStore()
+		store.client = kubefake.NewSimpleClientset(secret)
+		store.namespace = "test-ns"
+		store.secretName = "creds"
+
+		store.loadFromSecret(context.Background())
+		_, ok := store.Get("cluster-b-ca")
+		if ok {
+			t.Error("expected key without -token suffix to be skipped")
+		}
+	})
+}
+
+func TestSaveToSecret(t *testing.T) {
+	t.Run("nil client is no-op", func(t *testing.T) {
+		store := newTestStore()
+		err := store.saveToSecret(context.Background())
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+	})
+	t.Run("no persisted tokens is no-op", func(t *testing.T) {
+		store := newTestStore()
+		store.client = kubefake.NewSimpleClientset()
+		store.namespace = "test-ns"
+		store.secretName = "creds"
+		// Only mounted token
+		store.credentials["cluster-a"] = &Credentials{Token: "tok", source: tokenMounted}
+
+		err := store.saveToSecret(context.Background())
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+	})
+	t.Run("saves only persisted tokens", func(t *testing.T) {
+		fakeClient := kubefake.NewSimpleClientset()
+		store := newTestStore()
+		store.client = fakeClient
+		store.namespace = "test-ns"
+		store.secretName = "creds"
+		store.credentials["cluster-a"] = &Credentials{Token: "mounted-tok", source: tokenMounted}
+		store.credentials["cluster-b"] = &Credentials{Token: "persisted-tok", source: tokenPersisted}
+
+		err := store.saveToSecret(context.Background())
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+
+		secret, err := fakeClient.CoreV1().Secrets("test-ns").Get(context.Background(), "creds", metav1.GetOptions{})
+		if err != nil {
+			t.Fatalf("failed to get secret: %v", err)
+		}
+		if string(secret.Data["cluster-b-token"]) != "persisted-tok" {
+			t.Errorf("cluster-b-token = %q, want %q", string(secret.Data["cluster-b-token"]), "persisted-tok")
+		}
+		if _, ok := secret.Data["cluster-a-token"]; ok {
+			t.Error("mounted token should not be in secret")
+		}
+	})
+	t.Run("creates secret when update returns not found", func(t *testing.T) {
+		fakeClient := kubefake.NewSimpleClientset()
+		store := newTestStore()
+		store.client = fakeClient
+		store.namespace = "test-ns"
+		store.secretName = "creds"
+		store.credentials["cluster-b"] = &Credentials{Token: "tok", source: tokenPersisted}
+
+		err := store.saveToSecret(context.Background())
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+
+		// Verify secret was created
+		secret, err := fakeClient.CoreV1().Secrets("test-ns").Get(context.Background(), "creds", metav1.GetOptions{})
+		if err != nil {
+			t.Fatalf("secret should have been created: %v", err)
+		}
+		if string(secret.Data["cluster-b-token"]) != "tok" {
+			t.Errorf("token = %q, want %q", string(secret.Data["cluster-b-token"]), "tok")
+		}
+	})
+}
+
+func TestRenewToken_Dispatch(t *testing.T) {
+	t.Run("mounted source calls renewMountedToken path", func(t *testing.T) {
+		dir := t.TempDir()
+		tokenPath := filepath.Join(dir, "token")
+		os.WriteFile(tokenPath, []byte("new-token"), 0644)
+
+		cfg := &config.Config{
+			Clusters: map[string]config.ClusterConfig{
+				"cluster-a": {Issuer: "https://example.com", TokenPath: tokenPath},
+			},
+		}
+		store := newTestStoreWithConfig(cfg)
+		store.credentials["cluster-a"] = &Credentials{Token: "old-token", source: tokenMounted}
+
+		err := store.renewToken(context.Background(), "cluster-a", cfg.Clusters["cluster-a"])
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		creds, _ := store.Get("cluster-a")
+		if creds.Token != "new-token" {
+			t.Errorf("token = %q, want %q", creds.Token, "new-token")
+		}
+	})
+	t.Run("unknown source returns error", func(t *testing.T) {
+		cfg := &config.Config{
+			Clusters: map[string]config.ClusterConfig{
+				"cluster-a": {Issuer: "https://example.com"},
+			},
+		}
+		store := newTestStoreWithConfig(cfg)
+		store.credentials["cluster-a"] = &Credentials{Token: "tok", source: tokenSource(99)}
+
+		err := store.renewToken(context.Background(), "cluster-a", cfg.Clusters["cluster-a"])
+		if err == nil {
+			t.Error("expected error for unknown source")
+		}
+	})
+}
+
 func TestSetCACert_LoadsWhenEmpty(t *testing.T) {
 	store := newTestStore()
-	store.setCACert("cluster-b", []byte("test-ca"))
+	store.SetCACert("cluster-b", []byte("test-ca"))
 
 	creds, ok := store.Get("cluster-b")
 	if !ok {
@@ -48,7 +332,7 @@ func TestSetCACert_SetsCAOnExisting(t *testing.T) {
 	store := newTestStore()
 	store.credentials["cluster-b"] = &Credentials{Token: "existing-token"}
 
-	store.setCACert("cluster-b", []byte("test-ca"))
+	store.SetCACert("cluster-b", []byte("test-ca"))
 
 	creds, _ := store.Get("cluster-b")
 	if creds.Token != "existing-token" {

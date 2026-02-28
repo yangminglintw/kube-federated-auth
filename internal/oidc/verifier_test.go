@@ -164,6 +164,42 @@ func TestInvalidateVerifierClearsKIDs(t *testing.T) {
 	}
 }
 
+func TestRewriteJWKSURL(t *testing.T) {
+	tests := []struct {
+		name      string
+		jwksURL   string
+		apiServer string
+		want      string
+	}{
+		{
+			name:      "standard k8s URL rewritten",
+			jwksURL:   "https://kubernetes.default.svc.cluster.local/openid/v1/jwks",
+			apiServer: "https://10.0.0.1:6443",
+			want:      "https://10.0.0.1:6443/openid/v1/jwks",
+		},
+		{
+			name:      "URL without /openid/v1/jwks returned as-is",
+			jwksURL:   "https://example.com/.well-known/jwks.json",
+			apiServer: "https://10.0.0.1:6443",
+			want:      "https://example.com/.well-known/jwks.json",
+		},
+		{
+			name:      "apiServer trailing slash trimmed",
+			jwksURL:   "https://kubernetes.default.svc/openid/v1/jwks",
+			apiServer: "https://10.0.0.1:6443/",
+			want:      "https://10.0.0.1:6443/openid/v1/jwks",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := rewriteJWKSURL(tt.jwksURL, tt.apiServer)
+			if got != tt.want {
+				t.Errorf("rewriteJWKSURL() = %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
+
 // makeJWTHeader encodes a JSON object as a base64url JWT header segment.
 func makeJWTHeader(header map[string]any) string {
 	b, _ := json.Marshal(header)

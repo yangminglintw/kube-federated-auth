@@ -98,7 +98,7 @@ func NewStore(cfg *config.Config, secretName string) (*Store, error) {
 			if err != nil {
 				slog.Warn("could not load CA cert", "cluster", clusterName, "error", err)
 			} else {
-				s.setCACert(clusterName, ca)
+				s.SetCACert(clusterName, ca)
 				slog.Info("loaded CA cert from file", "cluster", clusterName)
 			}
 		}
@@ -144,8 +144,8 @@ func (s *Store) SetToken(cluster, token string) {
 	}
 }
 
-// setCACert updates a cluster's CA cert in-memory.
-func (s *Store) setCACert(cluster string, caCert []byte) {
+// SetCACert updates a cluster's CA cert in-memory.
+func (s *Store) SetCACert(cluster string, caCert []byte) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if existing, ok := s.credentials[cluster]; ok {
