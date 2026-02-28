@@ -60,7 +60,46 @@ server_logs() {
     ka logs -l app=kube-federated-auth --tail=100
 }
 
-# Wait for a service to be ready (up to 30 seconds)
+# Save the current ConfigMap data for later restore
+save_configmap() {
+    ka get configmap kube-federated-auth -o jsonpath='{.data.clusters\.yaml}' > "${BATS_SUITE_TMPDIR}/configmap-backup.yaml"
+}
+
+# Restore ConfigMap from saved backup and restart deployment
+restore_configmap() {
+    local backup="${BATS_SUITE_TMPDIR}/configmap-backup.yaml"
+    [[ -f "$backup" ]] || return 0
+    ka create configmap kube-federated-auth --from-file="clusters.yaml=${backup}" --dry-run=client -o yaml | ka apply -f -
+    restart_and_wait
+}
+
+# Patch ConfigMap by prepending a YAML field and restart deployment
+# Usage: patch_configmap_field "log_level: DEBUG"
+patch_configmap_field() {
+    local field="$1"
+    local current
+    current=$(ka get configmap kube-federated-auth -o jsonpath='{.data.clusters\.yaml}')
+    local patched
+    patched=$(printf '%s\n%s' "$field" "$current")
+    ka create configmap kube-federated-auth --from-file=clusters.yaml=<(echo "$patched") --dry-run=client -o yaml | ka apply -f -
+    restart_and_wait
+}
+
+# Restart the deployment and wait until both health and TokenReview are ready
+restart_and_wait() {
+    ka rollout restart deployment/kube-federated-auth
+    ka rollout status deployment/kube-federated-auth --timeout=60s
+    wait_for_service
+    wait_for_tokenreview
+}
+
+# Get logs from the current kube-federated-auth server pod since a given timestamp
+server_logs_since() {
+    local since="$1"
+    ka logs -l app=kube-federated-auth --since-time="$since"
+}
+
+# Wait for the health endpoint to respond (up to 30 seconds)
 wait_for_service() {
     local url="${1:-${SERVICE_URL}/health}"
     local attempts=0
@@ -72,5 +111,26 @@ wait_for_service() {
         attempts=$((attempts + 1))
     done
     echo "ERROR: service not ready at $url" >&2
+    return 1
+}
+
+# Wait for TokenReview to succeed (up to 30 seconds).
+# This warms up the OIDC verifier which lazily fetches JWKS keys on first request.
+wait_for_tokenreview() {
+    local token
+    token=$(get_token)
+    local attempts=0
+    while [[ $attempts -lt 30 ]]; do
+        local result
+        result=$(token_review "$token" 2>/dev/null) || true
+        local authenticated
+        authenticated=$(echo "$result" | jq -r '.status.authenticated' 2>/dev/null) || true
+        if [[ "$authenticated" == "true" ]]; then
+            return 0
+        fi
+        sleep 1
+        attempts=$((attempts + 1))
+    done
+    echo "ERROR: TokenReview not ready after 30s" >&2
     return 1
 }

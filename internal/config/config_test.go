@@ -278,6 +278,118 @@ func TestIsAuthorizedClient_MalformedEntry(t *testing.T) {
 	}
 }
 
+func TestLoad_GlobalCacheSettings(t *testing.T) {
+	content := `
+cache:
+  ttl: 60
+  max_entries: 1000
+clusters:
+  cluster-a:
+    issuer: "https://oidc.example.com"
+`
+	cfg := loadFromString(t, content)
+
+	if cfg.Cache == nil {
+		t.Fatal("expected global cache settings")
+	}
+	if cfg.Cache.TTL != 60 {
+		t.Errorf("TTL = %d, want 60", cfg.Cache.TTL)
+	}
+	if cfg.Cache.MaxEntries != 1000 {
+		t.Errorf("MaxEntries = %d, want 1000", cfg.Cache.MaxEntries)
+	}
+}
+
+func TestLoad_PerClusterCacheSettings(t *testing.T) {
+	content := `
+clusters:
+  cluster-a:
+    issuer: "https://oidc.example.com"
+    cache:
+      ttl: 30
+      max_entries: 500
+  cluster-b:
+    issuer: "https://oidc.other.com"
+`
+	cfg := loadFromString(t, content)
+
+	a := cfg.Clusters["cluster-a"]
+	if a.Cache == nil {
+		t.Fatal("expected per-cluster cache settings for cluster-a")
+	}
+	if a.Cache.TTL != 30 {
+		t.Errorf("cluster-a TTL = %d, want 30", a.Cache.TTL)
+	}
+	if a.Cache.MaxEntries != 500 {
+		t.Errorf("cluster-a MaxEntries = %d, want 500", a.Cache.MaxEntries)
+	}
+
+	b := cfg.Clusters["cluster-b"]
+	if b.Cache != nil {
+		t.Errorf("expected nil cache for cluster-b, got %+v", b.Cache)
+	}
+}
+
+func TestGetCacheSettings_Resolution(t *testing.T) {
+	content := `
+cache:
+  ttl: 60
+  max_entries: 1000
+clusters:
+  cluster-a:
+    issuer: "https://oidc.example.com"
+    cache:
+      ttl: 30
+      max_entries: 500
+  cluster-b:
+    issuer: "https://oidc.other.com"
+  cluster-c:
+    issuer: "https://oidc.third.com"
+`
+	cfg := loadFromString(t, content)
+
+	// Per-cluster overrides global
+	cs := cfg.GetCacheSettings("cluster-a")
+	if cs == nil {
+		t.Fatal("expected cache settings for cluster-a")
+	}
+	if cs.TTL != 30 {
+		t.Errorf("cluster-a TTL = %d, want 30", cs.TTL)
+	}
+
+	// Falls back to global
+	cs = cfg.GetCacheSettings("cluster-b")
+	if cs == nil {
+		t.Fatal("expected global cache settings for cluster-b")
+	}
+	if cs.TTL != 60 {
+		t.Errorf("cluster-b TTL = %d, want 60 (global)", cs.TTL)
+	}
+
+	// Unknown cluster falls back to global
+	cs = cfg.GetCacheSettings("unknown")
+	if cs == nil {
+		t.Fatal("expected global cache settings for unknown cluster")
+	}
+	if cs.TTL != 60 {
+		t.Errorf("unknown cluster TTL = %d, want 60 (global)", cs.TTL)
+	}
+}
+
+func TestGetCacheSettings_NoCacheConfigured(t *testing.T) {
+	content := `
+clusters:
+  cluster-a:
+    issuer: "https://oidc.example.com"
+`
+	cfg := loadFromString(t, content)
+
+	cs := cfg.GetCacheSettings("cluster-a")
+	if cs != nil {
+		t.Errorf("expected nil cache settings, got %+v", cs)
+	}
+}
+
 // Helper functions
 
 func loadFromString(t *testing.T, content string) *Config {

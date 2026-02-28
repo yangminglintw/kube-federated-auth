@@ -380,3 +380,40 @@ func TestExtractIdentity_MissingFields(t *testing.T) {
 		t.Errorf("serviceAccount = %q, want empty", sa)
 	}
 }
+
+func TestTokenReviewHandler_CacheConstructedFromConfig(t *testing.T) {
+	cfg := &config.Config{
+		Cache: &config.CacheSettings{TTL: 60, MaxEntries: 1000},
+		Clusters: map[string]config.ClusterConfig{
+			"cluster-a": {
+				Issuer: "https://a.example.com",
+				Cache:  &config.CacheSettings{TTL: 30, MaxEntries: 500},
+			},
+			"cluster-b": {
+				Issuer: "https://b.example.com",
+				// uses global cache
+			},
+		},
+	}
+	h := NewTokenReviewHandler(nil, cfg, nil)
+
+	if _, ok := h.caches["cluster-a"]; !ok {
+		t.Error("expected cache for cluster-a")
+	}
+	if _, ok := h.caches["cluster-b"]; !ok {
+		t.Error("expected cache for cluster-b (from global)")
+	}
+}
+
+func TestTokenReviewHandler_CacheDisabledByDefault(t *testing.T) {
+	cfg := &config.Config{
+		Clusters: map[string]config.ClusterConfig{
+			"cluster-a": {Issuer: "https://a.example.com"},
+		},
+	}
+	h := NewTokenReviewHandler(nil, cfg, nil)
+
+	if len(h.caches) != 0 {
+		t.Errorf("expected no caches when cache not configured, got %d", len(h.caches))
+	}
+}

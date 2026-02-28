@@ -33,7 +33,11 @@ func main() {
 		os.Exit(1)
 	}
 
-	slog.Info("config loaded", "clusters", cfg.ClusterNames(), "count", len(cfg.Clusters))
+	// Reconfigure logger with config-driven log level
+	logLevel := cfg.GetLogLevel()
+	slog.SetDefault(slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: logLevel})))
+
+	slog.Info("config loaded", "clusters", cfg.ClusterNames(), "count", len(cfg.Clusters), "log_level", cfg.LogLevel)
 
 	// Only create credential store if there are remote clusters
 	var credStore *credentials.Store

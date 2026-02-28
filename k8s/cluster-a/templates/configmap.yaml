@@ -8,6 +8,10 @@ data:
     authorized_clients:
       - "cluster-a/kube-federated-auth/test-client"
 
+    cache:
+      ttl: 60
+      max_entries: 1000
+
     clusters:
       # Local cluster (cluster-a)
       cluster-a:

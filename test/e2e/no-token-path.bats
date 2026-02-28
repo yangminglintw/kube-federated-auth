@@ -43,6 +43,7 @@ teardown() {
     ka rollout restart deployment/kube-federated-auth
     ka rollout status deployment/kube-federated-auth --timeout=60s
     wait_for_service
+    wait_for_tokenreview
 }
 
 @test "TokenReview works with token from Secret and no token_path" {
@@ -54,13 +55,14 @@ teardown() {
     ka create secret generic kube-federated-auth \
         --from-literal="cluster-b-token=${seed_token}"
 
-    # 2. Rollout restart and wait
+    # 2. Rollout restart and wait for full readiness
     ka rollout restart deployment/kube-federated-auth
     ka rollout status deployment/kube-federated-auth --timeout=60s
     wait_for_service
+    wait_for_tokenreview
 
-    # Give the renewal loop time to complete
-    sleep 5
+    # Give the renewal loop time to complete (runs in background goroutine)
+    sleep 2
 
     # 3. Check logs
     local logs

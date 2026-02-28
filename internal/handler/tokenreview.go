@@ -7,12 +7,15 @@ import (
 	"log/slog"
 	"net/http"
 	"strings"
+	"sync"
+	"time"
 
 	authv1 "k8s.io/api/authentication/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
 
+	"github.com/rophy/kube-federated-auth/internal/cache"
 	"github.com/rophy/kube-federated-auth/internal/config"
 	"github.com/rophy/kube-federated-auth/internal/credentials"
 	mw "github.com/rophy/kube-federated-auth/internal/middleware"
@@ -32,14 +35,31 @@ type TokenReviewHandler struct {
 	verifier  TokenVerifier
 	config    *config.Config
 	credStore *credentials.Store
+	caches    map[string]*cache.Cache[*authv1.TokenReview]
+	clients   map[string]kubernetes.Interface
+	clientsMu sync.RWMutex
 }
 
 func NewTokenReviewHandler(v TokenVerifier, cfg *config.Config, store *credentials.Store) *TokenReviewHandler {
-	return &TokenReviewHandler{
+	h := &TokenReviewHandler{
 		verifier:  v,
 		config:    cfg,
 		credStore: store,
+		caches:    make(map[string]*cache.Cache[*authv1.TokenReview]),
+		clients:   make(map[string]kubernetes.Interface),
 	}
+
+	if cfg != nil {
+		for name := range cfg.Clusters {
+			if cs := cfg.GetCacheSettings(name); cs != nil {
+				h.caches[name] = cache.New[*authv1.TokenReview](
+					time.Duration(cs.TTL)*time.Second, cs.MaxEntries,
+				)
+			}
+		}
+	}
+
+	return h
 }
 
 func (h *TokenReviewHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -88,6 +108,17 @@ func (h *TokenReviewHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	clientIdentity := fmt.Sprintf("%s/%s/%s", cluster, ns, sa)
 	*r = *r.WithContext(mw.SetClientIdentity(r.Context(), clientIdentity))
 
+	// Step 1.5: Check cache before forwarding
+	cacheKey := cache.HashKey(cluster, tr.Spec.Token)
+	if c, ok := h.caches[cluster]; ok {
+		if cached, hit := c.Get(cacheKey); hit {
+			slog.DebugContext(r.Context(), "cache hit", "cluster", cluster)
+			result := cached.DeepCopy()
+			json.NewEncoder(w).Encode(result)
+			return
+		}
+	}
+
 	// Step 2: Forward TokenReview to detected cluster
 	result, err := h.forwardTokenReview(r.Context(), cluster, &tr)
 	if err != nil {
@@ -103,6 +134,13 @@ func (h *TokenReviewHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			result.Status.User.Extra = make(map[string]authv1.ExtraValue)
 		}
 		result.Status.User.Extra[ExtraKeyClusterName] = authv1.ExtraValue{cluster}
+	}
+
+	// Cache authenticated results
+	if result.Status.Authenticated {
+		if c, ok := h.caches[cluster]; ok {
+			c.Set(cacheKey, result.DeepCopy())
+		}
 	}
 
 	// Return the response from the remote cluster
@@ -211,16 +249,10 @@ func (h *TokenReviewHandler) forwardTokenReview(ctx context.Context, clusterName
 		return nil, fmt.Errorf("cluster not found: %s", clusterName)
 	}
 
-	// Build REST config for the target cluster
-	restConfig, err := h.buildRESTConfig(clusterName, clusterCfg)
+	// Get or create cached Kubernetes client
+	client, err := h.getOrCreateClient(clusterName, clusterCfg)
 	if err != nil {
-		return nil, fmt.Errorf("building REST config: %w", err)
-	}
-
-	// Create Kubernetes client
-	client, err := kubernetes.NewForConfig(restConfig)
-	if err != nil {
-		return nil, fmt.Errorf("creating kubernetes client: %w", err)
+		return nil, fmt.Errorf("getting kubernetes client: %w", err)
 	}
 
 	// Forward TokenReview request
@@ -234,6 +266,37 @@ func (h *TokenReviewHandler) forwardTokenReview(ctx context.Context, clusterName
 	result.Kind = "TokenReview"
 
 	return result, nil
+}
+
+// getOrCreateClient returns a cached Kubernetes client for the cluster, creating one if needed.
+func (h *TokenReviewHandler) getOrCreateClient(clusterName string, clusterCfg config.ClusterConfig) (kubernetes.Interface, error) {
+	h.clientsMu.RLock()
+	if c, ok := h.clients[clusterName]; ok {
+		h.clientsMu.RUnlock()
+		return c, nil
+	}
+	h.clientsMu.RUnlock()
+
+	h.clientsMu.Lock()
+	defer h.clientsMu.Unlock()
+
+	// Double-check after acquiring write lock
+	if c, ok := h.clients[clusterName]; ok {
+		return c, nil
+	}
+
+	restConfig, err := h.buildRESTConfig(clusterName, clusterCfg)
+	if err != nil {
+		return nil, fmt.Errorf("building REST config: %w", err)
+	}
+
+	client, err := kubernetes.NewForConfig(restConfig)
+	if err != nil {
+		return nil, fmt.Errorf("creating kubernetes client: %w", err)
+	}
+
+	h.clients[clusterName] = client
+	return client, nil
 }
 
 // buildRESTConfig creates a REST config for the target cluster

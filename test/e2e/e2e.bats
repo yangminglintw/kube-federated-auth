@@ -3,6 +3,7 @@
 setup_file() {
     load 'test_helper'
     wait_for_service
+    wait_for_tokenreview
 }
 
 setup() {

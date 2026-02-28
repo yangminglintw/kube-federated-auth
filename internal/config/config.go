@@ -2,6 +2,7 @@ package config
 
 import (
 	"fmt"
+	"log/slog"
 	"os"
 	"strings"
 	"time"
@@ -61,11 +62,18 @@ func (r *RenewalSettings) UnmarshalYAML(unmarshal func(interface{}) error) error
 	return nil
 }
 
+// CacheSettings configures the TokenReview response cache.
+type CacheSettings struct {
+	TTL        int `yaml:"ttl"`         // seconds, 0 = disabled
+	MaxEntries int `yaml:"max_entries"` // max cached entries, 0 = disabled
+}
+
 type ClusterConfig struct {
-	Issuer    string `yaml:"issuer"`
-	APIServer string `yaml:"api_server,omitempty"` // Override URL for OIDC discovery
-	CACert    string `yaml:"ca_cert,omitempty"`
-	TokenPath string `yaml:"token_path,omitempty"`
+	Issuer    string         `yaml:"issuer"`
+	APIServer string         `yaml:"api_server,omitempty"` // Override URL for OIDC discovery
+	CACert    string         `yaml:"ca_cert,omitempty"`
+	TokenPath string         `yaml:"token_path,omitempty"`
+	Cache     *CacheSettings `yaml:"cache,omitempty"`
 }
 
 // DiscoveryURL returns the URL to use for OIDC discovery.
@@ -83,9 +91,25 @@ func (c *ClusterConfig) IsRemote() bool {
 }
 
 type Config struct {
-	AuthorizedClients []string                  `yaml:"authorized_clients,omitempty"`
-	Renewal           *RenewalSettings          `yaml:"renewal,omitempty"`
+	LogLevel          string                   `yaml:"log_level,omitempty"` // DEBUG, INFO, WARN, ERROR (default: INFO)
+	AuthorizedClients []string                 `yaml:"authorized_clients,omitempty"`
+	Renewal           *RenewalSettings         `yaml:"renewal,omitempty"`
+	Cache             *CacheSettings           `yaml:"cache,omitempty"`
 	Clusters          map[string]ClusterConfig `yaml:"clusters"`
+}
+
+// GetLogLevel returns the configured slog.Level, defaulting to INFO.
+func (c *Config) GetLogLevel() slog.Level {
+	switch strings.ToUpper(c.LogLevel) {
+	case "DEBUG":
+		return slog.LevelDebug
+	case "WARN":
+		return slog.LevelWarn
+	case "ERROR":
+		return slog.LevelError
+	default:
+		return slog.LevelInfo
+	}
 }
 
 // IsAuthorizedClient checks if a caller identity matches the authorized_clients whitelist.
@@ -154,6 +178,16 @@ func Load(path string) (*Config, error) {
 	}
 
 	return &cfg, nil
+}
+
+// GetCacheSettings returns the cache settings for a cluster.
+// Per-cluster settings take precedence over global settings.
+// Returns nil if no cache is configured.
+func (c *Config) GetCacheSettings(clusterName string) *CacheSettings {
+	if cluster, ok := c.Clusters[clusterName]; ok && cluster.Cache != nil {
+		return cluster.Cache
+	}
+	return c.Cache
 }
 
 func (c *Config) ClusterNames() []string {
