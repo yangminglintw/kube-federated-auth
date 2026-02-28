@@ -106,6 +106,14 @@ if ! kubectl --context "$KUBE_CONTEXT_B" cluster-info &>/dev/null; then
   exit 1
 fi
 
+# --- Increase inotify limits on Kind node (k6 needs fsnotify) ---
+
+CLUSTER_NAME="${KUBE_CONTEXT#kind-}"
+if docker exec "${CLUSTER_NAME}-control-plane" \
+  sysctl -w fs.inotify.max_user_instances=512 &>/dev/null; then
+  echo "Increased inotify max_user_instances on ${CLUSTER_NAME}-control-plane"
+fi
+
 # --- Cleanup from previous runs ---
 
 cleanup() {
