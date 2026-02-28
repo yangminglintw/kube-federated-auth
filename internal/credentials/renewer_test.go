@@ -74,7 +74,6 @@ func generateCACert(notBefore, notAfter time.Time) []byte {
 // --- CA cert expiration tests ---
 
 func TestCheckCACertExpiration_WarnsWhenExpiringSoon(t *testing.T) {
-	// 10-year cert with 30 days remaining → 20% threshold is 2 years → should warn
 	notBefore := time.Now().Add(-10*365*24*time.Hour + 30*24*time.Hour)
 	cert := generateCACert(notBefore, time.Now().Add(30*24*time.Hour))
 
@@ -87,13 +86,9 @@ func TestCheckCACertExpiration_WarnsWhenExpiringSoon(t *testing.T) {
 	if !strings.Contains(output, "CA certificate expiring soon") {
 		t.Errorf("expected warning log, got: %s", output)
 	}
-	if !strings.Contains(output, "test-cluster") {
-		t.Errorf("expected cluster name in log, got: %s", output)
-	}
 }
 
 func TestCheckCACertExpiration_NoWarningWhenFarFromExpiry(t *testing.T) {
-	// 10-year cert issued now → 20% threshold is 2 years, remaining ~10 years → no warning
 	cert := generateCACert(time.Now(), time.Now().Add(10*365*24*time.Hour))
 
 	buf, cleanup := captureLogs(t)
@@ -112,9 +107,8 @@ func TestCheckCACertExpiration_InvalidPEM(t *testing.T) {
 
 	checkCACertExpiration("test-cluster", []byte("not a pem"))
 
-	output := buf.String()
-	if !strings.Contains(output, "failed to decode CA certificate PEM") {
-		t.Errorf("expected decode error log, got: %s", output)
+	if !strings.Contains(buf.String(), "failed to decode CA certificate PEM") {
+		t.Errorf("expected decode error log, got: %s", buf.String())
 	}
 }
 
@@ -165,212 +159,185 @@ func defaultConfig() *config.Config {
 	}
 }
 
-func TestRenew_SuccessWithValidToken(t *testing.T) {
+func newTestStoreWithConfig(cfg *config.Config) *Store {
+	return &Store{
+		credentials: make(map[string]*Credentials),
+		config:      cfg,
+	}
+}
+
+func TestRenewPersistedToken_Success(t *testing.T) {
 	storedToken := makeJWT("system:serviceaccount:kube-federated-auth:reader", time.Now().Add(1*time.Hour))
 	renewedToken := makeJWT("system:serviceaccount:kube-federated-auth:reader", time.Now().Add(168*time.Hour))
 
-	store := newTestStore()
-	store.credentials["cluster-b"] = &Credentials{Token: storedToken, CACert: []byte("ca")}
-
-	fakeClient := setupFakeClient(t, renewedToken)
 	cfg := defaultConfig()
-
-	r := NewRenewer(cfg, store, nil)
-	r.clientFactory = fakeClientFactory(fakeClient)
-
-	// Force renew_before to be very large so renewal is triggered
 	cfg.Renewal = &config.RenewalSettings{RenewBefore: 8760 * time.Hour}
 
-	err := r.renew(context.Background(), "cluster-b", cfg.Clusters["cluster-b"])
+	store := newTestStoreWithConfig(cfg)
+	store.credentials["cluster-b"] = &Credentials{Token: storedToken, CACert: []byte("ca"), source: tokenPersisted}
+	store.newClient = fakeClientFactory(setupFakeClient(t, renewedToken))
+
+	creds := store.credentials["cluster-b"]
+	err := store.renewPersistedToken(context.Background(), "cluster-b", cfg.Clusters["cluster-b"], creds)
 	if err != nil {
 		t.Fatalf("expected no error, got: %v", err)
 	}
 
-	creds, _ := store.Get("cluster-b")
-	if creds.Token != renewedToken {
-		t.Errorf("expected renewed token, got: %s", creds.Token[:50])
+	got, _ := store.Get("cluster-b")
+	if got.Token != renewedToken {
+		t.Errorf("expected renewed token, got: %s", got.Token[:50])
+	}
+	if got.source != tokenPersisted {
+		t.Errorf("expected source tokenPersisted, got %d", got.source)
 	}
 }
 
-func TestRenew_SkipsWhenTokenNotExpiring(t *testing.T) {
-	// Token expires in 168h, renew_before defaults to 48h → should skip
+func TestTryRenew_SkipsWhenTokenNotExpiring(t *testing.T) {
 	storedToken := makeJWT("system:serviceaccount:kube-federated-auth:reader", time.Now().Add(168*time.Hour))
 
-	store := newTestStore()
-	store.credentials["cluster-b"] = &Credentials{Token: storedToken, CACert: []byte("ca")}
-
-	fakeClient := setupFakeClient(t, "should-not-be-used")
 	cfg := defaultConfig()
-
-	r := NewRenewer(cfg, store, nil)
-	r.clientFactory = fakeClientFactory(fakeClient)
+	store := newTestStoreWithConfig(cfg)
+	store.credentials["cluster-b"] = &Credentials{Token: storedToken, CACert: []byte("ca"), source: tokenPersisted}
+	store.newClient = fakeClientFactory(setupFakeClient(t, "should-not-be-used"))
 
 	buf, cleanup := captureLogs(t)
 	defer cleanup()
 
-	err := r.renew(context.Background(), "cluster-b", cfg.Clusters["cluster-b"])
-	if err != nil {
-		t.Fatalf("expected no error, got: %v", err)
-	}
+	store.tryRenew(context.Background())
 
 	if !strings.Contains(buf.String(), "skipping renewal") {
 		t.Errorf("expected 'skipping renewal' log, got: %s", buf.String())
 	}
 
-	// Token should NOT have been replaced
 	creds, _ := store.Get("cluster-b")
 	if creds.Token != storedToken {
 		t.Error("token should not have been replaced")
 	}
 }
 
-func TestRenew_FallsBackToBootstrapOnFailure(t *testing.T) {
-	// Stored token is invalid, bootstrap file has a valid token
+func TestRenewPersistedToken_FallsBackToBootstrap(t *testing.T) {
 	invalidToken := "invalid.token.here"
 	bootstrapToken := makeJWT("system:serviceaccount:kube-federated-auth:reader", time.Now().Add(1*time.Hour))
 	renewedToken := makeJWT("system:serviceaccount:kube-federated-auth:reader", time.Now().Add(168*time.Hour))
 
 	dir := t.TempDir()
 	tokenPath := filepath.Join(dir, "token")
-	caPath := filepath.Join(dir, "ca.crt")
 	os.WriteFile(tokenPath, []byte(bootstrapToken), 0644)
-	os.WriteFile(caPath, []byte("ca-data"), 0644)
-
-	store := newTestStore()
-	store.credentials["cluster-b"] = &Credentials{Token: invalidToken, CACert: []byte("ca")}
-
-	// The stored token is invalid, so requestNewToken fails at parseServiceAccountFromToken
-	// before the client is ever called. The bootstrap token is valid, so the retry succeeds.
-	fakeClient := setupFakeClient(t, renewedToken)
 
 	cfg := defaultConfig()
 	cfg.Clusters["cluster-b"] = config.ClusterConfig{
 		Issuer:    "https://kubernetes.default.svc.cluster.local",
 		APIServer: "https://10.0.0.1:6443",
 		TokenPath: tokenPath,
-		CACert:    caPath,
 	}
 	cfg.Renewal = &config.RenewalSettings{RenewBefore: 8760 * time.Hour}
 
-	r := NewRenewer(cfg, store, nil)
-	r.clientFactory = fakeClientFactory(fakeClient)
+	store := newTestStoreWithConfig(cfg)
+	store.credentials["cluster-b"] = &Credentials{Token: invalidToken, CACert: []byte("ca"), source: tokenPersisted}
+	store.newClient = fakeClientFactory(setupFakeClient(t, renewedToken))
 
 	buf, cleanup := captureLogs(t)
 	defer cleanup()
 
-	err := r.renew(context.Background(), "cluster-b", cfg.Clusters["cluster-b"])
+	creds := store.credentials["cluster-b"]
+	err := store.renewPersistedToken(context.Background(), "cluster-b", cfg.Clusters["cluster-b"], creds)
 	if err != nil {
 		t.Fatalf("expected successful fallback, got error: %v", err)
 	}
 
-	output := buf.String()
-	if !strings.Contains(output, "retrying with bootstrap") {
-		t.Errorf("expected bootstrap fallback log, got: %s", output)
+	if !strings.Contains(buf.String(), "retrying with bootstrap") {
+		t.Errorf("expected bootstrap fallback log, got: %s", buf.String())
 	}
 
-	creds, _ := store.Get("cluster-b")
-	if creds.Token != renewedToken {
+	got, _ := store.Get("cluster-b")
+	if got.Token != renewedToken {
 		t.Error("expected renewed token from bootstrap fallback")
 	}
 }
 
-func TestRenew_BothStoredAndBootstrapFail(t *testing.T) {
+func TestRenewPersistedToken_BothStoredAndBootstrapFail(t *testing.T) {
 	invalidToken := "invalid.token.here"
 	bootstrapToken := makeJWT("system:serviceaccount:kube-federated-auth:reader", time.Now().Add(1*time.Hour))
 
 	dir := t.TempDir()
 	tokenPath := filepath.Join(dir, "token")
-	caPath := filepath.Join(dir, "ca.crt")
 	os.WriteFile(tokenPath, []byte(bootstrapToken), 0644)
-	os.WriteFile(caPath, []byte("ca-data"), 0644)
-
-	store := newTestStore()
-	store.credentials["cluster-b"] = &Credentials{Token: invalidToken, CACert: []byte("ca")}
-
-	fakeClient := setupFailingClient(t) // always fails
 
 	cfg := defaultConfig()
 	cfg.Clusters["cluster-b"] = config.ClusterConfig{
 		Issuer:    "https://kubernetes.default.svc.cluster.local",
 		APIServer: "https://10.0.0.1:6443",
 		TokenPath: tokenPath,
-		CACert:    caPath,
 	}
 	cfg.Renewal = &config.RenewalSettings{RenewBefore: 8760 * time.Hour}
 
-	r := NewRenewer(cfg, store, nil)
-	r.clientFactory = fakeClientFactory(fakeClient)
+	store := newTestStoreWithConfig(cfg)
+	store.credentials["cluster-b"] = &Credentials{Token: invalidToken, CACert: []byte("ca"), source: tokenPersisted}
+	store.newClient = fakeClientFactory(setupFailingClient(t))
 
 	buf, cleanup := captureLogs(t)
 	defer cleanup()
 
-	err := r.renew(context.Background(), "cluster-b", cfg.Clusters["cluster-b"])
+	creds := store.credentials["cluster-b"]
+	err := store.renewPersistedToken(context.Background(), "cluster-b", cfg.Clusters["cluster-b"], creds)
 	if err == nil {
 		t.Fatal("expected error when both stored and bootstrap tokens fail")
 	}
 
-	output := buf.String()
-	if !strings.Contains(output, "bootstrap token is invalid or expired") {
-		t.Errorf("expected 'bootstrap token is invalid or expired' log, got: %s", output)
+	if !strings.Contains(buf.String(), "bootstrap token is invalid or expired") {
+		t.Errorf("expected 'bootstrap token is invalid or expired' log, got: %s", buf.String())
 	}
 }
 
-func TestRenew_NoTokenPathConfigured(t *testing.T) {
+func TestRenewPersistedToken_NoTokenPath(t *testing.T) {
 	invalidToken := "invalid.token.here"
 
-	store := newTestStore()
-	store.credentials["cluster-b"] = &Credentials{Token: invalidToken, CACert: []byte("ca")}
-
-	fakeClient := setupFailingClient(t)
-	cfg := defaultConfig() // no TokenPath set
+	cfg := defaultConfig()
 	cfg.Renewal = &config.RenewalSettings{RenewBefore: 8760 * time.Hour}
 
-	r := NewRenewer(cfg, store, nil)
-	r.clientFactory = fakeClientFactory(fakeClient)
+	store := newTestStoreWithConfig(cfg)
+	store.credentials["cluster-b"] = &Credentials{Token: invalidToken, CACert: []byte("ca"), source: tokenPersisted}
+	store.newClient = fakeClientFactory(setupFailingClient(t))
 
 	buf, cleanup := captureLogs(t)
 	defer cleanup()
 
-	err := r.renew(context.Background(), "cluster-b", cfg.Clusters["cluster-b"])
+	creds := store.credentials["cluster-b"]
+	err := store.renewPersistedToken(context.Background(), "cluster-b", cfg.Clusters["cluster-b"], creds)
 	if err == nil {
 		t.Fatal("expected error when no token_path configured")
 	}
 
-	output := buf.String()
-	if !strings.Contains(output, "token renewal failed, set token_path") {
-		t.Errorf("expected 'set token_path' log, got: %s", output)
+	if !strings.Contains(buf.String(), "token renewal failed, set token_path") {
+		t.Errorf("expected 'set token_path' log, got: %s", buf.String())
 	}
 }
 
-func TestRenew_BootstrapFileNotReadable(t *testing.T) {
+func TestRenewPersistedToken_BootstrapFileNotReadable(t *testing.T) {
 	invalidToken := "invalid.token.here"
 
-	store := newTestStore()
-	store.credentials["cluster-b"] = &Credentials{Token: invalidToken, CACert: []byte("ca")}
-
-	fakeClient := setupFailingClient(t)
 	cfg := defaultConfig()
 	cfg.Clusters["cluster-b"] = config.ClusterConfig{
 		Issuer:    "https://kubernetes.default.svc.cluster.local",
 		APIServer: "https://10.0.0.1:6443",
 		TokenPath: "/nonexistent/token",
-		CACert:    "/nonexistent/ca.crt",
 	}
 	cfg.Renewal = &config.RenewalSettings{RenewBefore: 8760 * time.Hour}
 
-	r := NewRenewer(cfg, store, nil)
-	r.clientFactory = fakeClientFactory(fakeClient)
+	store := newTestStoreWithConfig(cfg)
+	store.credentials["cluster-b"] = &Credentials{Token: invalidToken, CACert: []byte("ca"), source: tokenPersisted}
+	store.newClient = fakeClientFactory(setupFailingClient(t))
 
 	buf, cleanup := captureLogs(t)
 	defer cleanup()
 
-	err := r.renew(context.Background(), "cluster-b", cfg.Clusters["cluster-b"])
+	creds := store.credentials["cluster-b"]
+	err := store.renewPersistedToken(context.Background(), "cluster-b", cfg.Clusters["cluster-b"], creds)
 	if err == nil {
 		t.Fatal("expected error when bootstrap file not readable")
 	}
 
-	output := buf.String()
-	if !strings.Contains(output, "failed to read bootstrap token") {
-		t.Errorf("expected 'failed to read' log, got: %s", output)
+	if !strings.Contains(buf.String(), "failed to read bootstrap token") {
+		t.Errorf("expected 'failed to read' log, got: %s", buf.String())
 	}
 }

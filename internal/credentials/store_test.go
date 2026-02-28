@@ -4,12 +4,14 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+
+	"github.com/rophy/kube-federated-auth/internal/config"
 )
 
 func newTestStore() *Store {
 	return &Store{
 		credentials: make(map[string]*Credentials),
-		managed:     make(map[string]bool),
+		config:      &config.Config{Clusters: make(map[string]config.ClusterConfig)},
 	}
 }
 
@@ -26,14 +28,9 @@ func writeTestFiles(t *testing.T, dir, token, ca string) (tokenPath, caPath stri
 	return
 }
 
-func TestLoadCACertFromFile_LoadsWhenEmpty(t *testing.T) {
-	dir := t.TempDir()
-	_, caPath := writeTestFiles(t, dir, "", "test-ca")
-
+func TestSetCACert_LoadsWhenEmpty(t *testing.T) {
 	store := newTestStore()
-	if err := store.LoadCACertFromFile("cluster-b", caPath); err != nil {
-		t.Fatal(err)
-	}
+	store.setCACert("cluster-b", []byte("test-ca"))
 
 	creds, ok := store.Get("cluster-b")
 	if !ok {
@@ -47,16 +44,11 @@ func TestLoadCACertFromFile_LoadsWhenEmpty(t *testing.T) {
 	}
 }
 
-func TestLoadCACertFromFile_SetsCAOnExisting(t *testing.T) {
-	dir := t.TempDir()
-	_, caPath := writeTestFiles(t, dir, "", "test-ca")
-
+func TestSetCACert_SetsCAOnExisting(t *testing.T) {
 	store := newTestStore()
 	store.credentials["cluster-b"] = &Credentials{Token: "existing-token"}
 
-	if err := store.LoadCACertFromFile("cluster-b", caPath); err != nil {
-		t.Fatal(err)
-	}
+	store.setCACert("cluster-b", []byte("test-ca"))
 
 	creds, _ := store.Get("cluster-b")
 	if creds.Token != "existing-token" {
@@ -67,12 +59,53 @@ func TestLoadCACertFromFile_SetsCAOnExisting(t *testing.T) {
 	}
 }
 
-func TestLoadBootstrapToken_LoadsWhenEmpty(t *testing.T) {
-	dir := t.TempDir()
-	tokenPath, _ := writeTestFiles(t, dir, "bootstrap-token", "")
-
+func TestSetToken_LoadsWhenEmpty(t *testing.T) {
 	store := newTestStore()
-	if err := store.LoadBootstrapToken("cluster-b", tokenPath); err != nil {
+	store.SetToken("cluster-b", "test-token")
+
+	creds, ok := store.Get("cluster-b")
+	if !ok {
+		t.Fatal("expected credentials to be created")
+	}
+	if creds.Token != "test-token" {
+		t.Errorf("expected token 'test-token', got '%s'", creds.Token)
+	}
+}
+
+func TestSetToken_OverwritesExisting(t *testing.T) {
+	store := newTestStore()
+	store.credentials["cluster-b"] = &Credentials{
+		Token:  "old-token",
+		CACert: []byte("existing-ca"),
+	}
+
+	store.SetToken("cluster-b", "new-token")
+
+	creds, _ := store.Get("cluster-b")
+	if creds.Token != "new-token" {
+		t.Errorf("expected token 'new-token', got '%s'", creds.Token)
+	}
+	if string(creds.CACert) != "existing-ca" {
+		t.Errorf("expected CA cert preserved, got '%s'", string(creds.CACert))
+	}
+}
+
+func TestNewStore_LoadsFromFiles(t *testing.T) {
+	dir := t.TempDir()
+	tokenPath, caPath := writeTestFiles(t, dir, "bootstrap-token", "test-ca")
+
+	cfg := &config.Config{
+		Clusters: map[string]config.ClusterConfig{
+			"cluster-b": {
+				Issuer:    "https://example.com",
+				TokenPath: tokenPath,
+				CACert:    caPath,
+			},
+		},
+	}
+
+	store, err := NewStore(cfg, "test-secret")
+	if err != nil {
 		t.Fatal(err)
 	}
 
@@ -83,41 +116,61 @@ func TestLoadBootstrapToken_LoadsWhenEmpty(t *testing.T) {
 	if creds.Token != "bootstrap-token" {
 		t.Errorf("expected token 'bootstrap-token', got '%s'", creds.Token)
 	}
-}
-
-func TestLoadBootstrapToken_SkipsWhenTokenExists(t *testing.T) {
-	dir := t.TempDir()
-	tokenPath, _ := writeTestFiles(t, dir, "bootstrap-token", "")
-
-	store := newTestStore()
-	store.credentials["cluster-b"] = &Credentials{Token: "renewed-token"}
-
-	if err := store.LoadBootstrapToken("cluster-b", tokenPath); err != nil {
-		t.Fatal(err)
+	if string(creds.CACert) != "test-ca" {
+		t.Errorf("expected CA cert 'test-ca', got '%s'", string(creds.CACert))
 	}
-
-	creds, _ := store.Get("cluster-b")
-	if creds.Token != "renewed-token" {
-		t.Errorf("expected existing token preserved, got '%s'", creds.Token)
+	if creds.source != tokenMounted {
+		t.Errorf("expected source tokenMounted, got %d", creds.source)
 	}
 }
 
-func TestLoadFromFiles_AlwaysOverwrites(t *testing.T) {
-	dir := t.TempDir()
-	tokenPath, caPath := writeTestFiles(t, dir, "bootstrap-token", "bootstrap-ca")
-
-	store := newTestStore()
-	store.credentials["cluster-b"] = &Credentials{
-		Token:  "renewed-token",
-		CACert: []byte("renewed-ca"),
+func TestNewStore_SkipsMissingFiles(t *testing.T) {
+	cfg := &config.Config{
+		Clusters: map[string]config.ClusterConfig{
+			"cluster-b": {
+				Issuer:    "https://example.com",
+				TokenPath: "/nonexistent/token",
+				CACert:    "/nonexistent/ca.crt",
+			},
+		},
 	}
 
-	if err := store.LoadFromFiles("cluster-b", tokenPath, caPath); err != nil {
+	store, err := NewStore(cfg, "test-secret")
+	if err != nil {
 		t.Fatal(err)
 	}
 
-	creds, _ := store.Get("cluster-b")
-	if creds.Token != "bootstrap-token" {
-		t.Errorf("expected LoadFromFiles to overwrite with 'bootstrap-token', got '%s'", creds.Token)
+	_, ok := store.Get("cluster-b")
+	if ok {
+		t.Error("expected no credentials for missing files")
+	}
+}
+
+func TestRenewMountedToken(t *testing.T) {
+	dir := t.TempDir()
+	tokenPath := filepath.Join(dir, "token")
+	os.WriteFile(tokenPath, []byte("original-token"), 0644)
+
+	store := newTestStore()
+	store.credentials["cluster-a"] = &Credentials{
+		Token:  "original-token",
+		source: tokenMounted,
+	}
+
+	cfg := config.ClusterConfig{TokenPath: tokenPath}
+
+	// Write new token to file (simulating kubelet rotation)
+	os.WriteFile(tokenPath, []byte("rotated-token"), 0644)
+
+	if err := store.renewMountedToken("cluster-a", cfg); err != nil {
+		t.Fatal(err)
+	}
+
+	creds, _ := store.Get("cluster-a")
+	if creds.Token != "rotated-token" {
+		t.Errorf("expected 'rotated-token', got '%s'", creds.Token)
+	}
+	if creds.source != tokenMounted {
+		t.Errorf("expected source tokenMounted after renewal")
 	}
 }
