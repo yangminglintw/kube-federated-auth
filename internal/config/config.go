@@ -74,6 +74,8 @@ type ClusterConfig struct {
 	CACert    string         `yaml:"ca_cert,omitempty"`
 	TokenPath string         `yaml:"token_path,omitempty"`
 	Cache     *CacheSettings `yaml:"cache,omitempty"`
+	QPS       float32        `yaml:"qps,omitempty"`
+	Burst     int            `yaml:"burst,omitempty"`
 }
 
 // DiscoveryURL returns the URL to use for OIDC discovery.

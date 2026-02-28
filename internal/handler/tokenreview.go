@@ -313,25 +313,40 @@ func (h *TokenReviewHandler) buildRESTConfig(clusterName string, clusterCfg conf
 			}
 		}
 
-		return &rest.Config{
+		rc := &rest.Config{
 			Host:        clusterCfg.APIServer,
 			BearerToken: bearerToken,
 			TLSClientConfig: rest.TLSClientConfig{
 				CAData: caCert,
 			},
-		}, nil
+		}
+		applyRateLimits(rc, clusterCfg)
+		return rc, nil
 	}
 
 	// For local clusters, try in-cluster config first
 	inClusterConfig, err := rest.InClusterConfig()
 	if err == nil {
+		applyRateLimits(inClusterConfig, clusterCfg)
 		return inClusterConfig, nil
 	}
 
 	// Fallback: use issuer as host (for testing)
-	return &rest.Config{
+	rc := &rest.Config{
 		Host: clusterCfg.Issuer,
-	}, nil
+	}
+	applyRateLimits(rc, clusterCfg)
+	return rc, nil
+}
+
+// applyRateLimits sets QPS and Burst on the REST config when configured.
+func applyRateLimits(rc *rest.Config, clusterCfg config.ClusterConfig) {
+	if clusterCfg.QPS > 0 {
+		rc.QPS = clusterCfg.QPS
+	}
+	if clusterCfg.Burst > 0 {
+		rc.Burst = clusterCfg.Burst
+	}
 }
 
 func (h *TokenReviewHandler) writeUnauthenticated(w http.ResponseWriter, req *authv1.TokenReview, errMsg string) {

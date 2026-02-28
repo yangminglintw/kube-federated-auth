@@ -1,9 +1,11 @@
 package config
 
 import (
+	"log/slog"
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 )
 
 func TestLoad_ValidConfig(t *testing.T) {
@@ -278,6 +280,79 @@ func TestIsAuthorizedClient_MalformedEntry(t *testing.T) {
 	}
 }
 
+func TestDiscoveryURL(t *testing.T) {
+	tests := []struct {
+		name string
+		cfg  ClusterConfig
+		want string
+	}{
+		{
+			name: "api_server set",
+			cfg:  ClusterConfig{Issuer: "https://issuer.example.com", APIServer: "https://api.example.com"},
+			want: "https://api.example.com",
+		},
+		{
+			name: "api_server empty falls back to issuer",
+			cfg:  ClusterConfig{Issuer: "https://issuer.example.com"},
+			want: "https://issuer.example.com",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := tt.cfg.DiscoveryURL(); got != tt.want {
+				t.Errorf("DiscoveryURL() = %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestGetLogLevel(t *testing.T) {
+	tests := []struct {
+		input string
+		want  slog.Level
+	}{
+		{"DEBUG", slog.LevelDebug},
+		{"debug", slog.LevelDebug},
+		{"WARN", slog.LevelWarn},
+		{"warn", slog.LevelWarn},
+		{"ERROR", slog.LevelError},
+		{"error", slog.LevelError},
+		{"INFO", slog.LevelInfo},
+		{"info", slog.LevelInfo},
+		{"", slog.LevelInfo},
+		{"bogus", slog.LevelInfo},
+	}
+	for _, tt := range tests {
+		t.Run(tt.input, func(t *testing.T) {
+			cfg := &Config{LogLevel: tt.input}
+			if got := cfg.GetLogLevel(); got != tt.want {
+				t.Errorf("GetLogLevel(%q) = %v, want %v", tt.input, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestGetRenewalRenewBefore(t *testing.T) {
+	t.Run("custom value", func(t *testing.T) {
+		cfg := &Config{Renewal: &RenewalSettings{RenewBefore: 24 * time.Hour}}
+		if got := cfg.GetRenewalRenewBefore(); got != 24*time.Hour {
+			t.Errorf("GetRenewalRenewBefore() = %v, want 24h", got)
+		}
+	})
+	t.Run("nil renewal returns default", func(t *testing.T) {
+		cfg := &Config{}
+		if got := cfg.GetRenewalRenewBefore(); got != DefaultRenewalRenewBefore {
+			t.Errorf("GetRenewalRenewBefore() = %v, want %v", got, DefaultRenewalRenewBefore)
+		}
+	})
+	t.Run("zero value returns default", func(t *testing.T) {
+		cfg := &Config{Renewal: &RenewalSettings{}}
+		if got := cfg.GetRenewalRenewBefore(); got != DefaultRenewalRenewBefore {
+			t.Errorf("GetRenewalRenewBefore() = %v, want %v", got, DefaultRenewalRenewBefore)
+		}
+	})
+}
+
 func TestLoad_GlobalCacheSettings(t *testing.T) {
 	content := `
 cache:
@@ -387,6 +462,35 @@ clusters:
 	cs := cfg.GetCacheSettings("cluster-a")
 	if cs != nil {
 		t.Errorf("expected nil cache settings, got %+v", cs)
+	}
+}
+
+func TestLoad_QPSAndBurst(t *testing.T) {
+	content := `
+clusters:
+  cluster-a:
+    issuer: "https://oidc.example.com"
+    qps: 100
+    burst: 200
+  cluster-b:
+    issuer: "https://oidc.other.com"
+`
+	cfg := loadFromString(t, content)
+
+	a := cfg.Clusters["cluster-a"]
+	if a.QPS != 100 {
+		t.Errorf("cluster-a QPS = %v, want 100", a.QPS)
+	}
+	if a.Burst != 200 {
+		t.Errorf("cluster-a Burst = %d, want 200", a.Burst)
+	}
+
+	b := cfg.Clusters["cluster-b"]
+	if b.QPS != 0 {
+		t.Errorf("cluster-b QPS = %v, want 0", b.QPS)
+	}
+	if b.Burst != 0 {
+		t.Errorf("cluster-b Burst = %d, want 0", b.Burst)
 	}
 }
 
