@@ -1,4 +1,4 @@
-.PHONY: build image kind deploy test-unit test-e2e test destroy clean help
+.PHONY: build image kind deploy test-unit test-e2e test test-perf destroy clean help
 
 .DEFAULT_GOAL := help
 
@@ -42,6 +42,9 @@ test-unit: ## Run unit tests
 
 test-e2e: ## Run e2e tests
 	bats test/e2e/
+
+test-perf: ## Run k6 performance tests
+	bash test/perf/run.sh
 
 ## Help
 
