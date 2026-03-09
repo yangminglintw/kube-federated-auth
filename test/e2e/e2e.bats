@@ -10,6 +10,20 @@ setup() {
     load 'test_helper'
 }
 
+@test "metrics endpoint returns prometheus metrics" {
+    local result
+    result=$(kexec curl -s "${SERVICE_URL}/metrics")
+
+    echo "# Response (first 10 lines): $(echo "$result" | head -10)"
+
+    # Should contain kfa_ prefixed metrics
+    echo "$result" | grep -q "kfa_http_requests_total"
+    echo "$result" | grep -q "kfa_server_info"
+
+    # server_info should have the version label set to 1
+    echo "$result" | grep -qE 'kfa_server_info\{version="[^"]+"\} 1'
+}
+
 @test "health endpoint returns ok" {
     local result
     result=$(kexec curl -s "${SERVICE_URL}/health")
