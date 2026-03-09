@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/coreos/go-oidc/v3/oidc"
+	"github.com/prometheus/client_golang/prometheus"
 	"github.com/rophy/kube-federated-auth/internal/config"
 	"github.com/rophy/kube-federated-auth/internal/credentials"
 )
@@ -39,6 +40,7 @@ type VerifierManager struct {
 	config          *config.Config
 	credStore       *credentials.Store
 	testHTTPClients map[string]*http.Client // for testing only
+	degradedGauge   *prometheus.GaugeVec    // optional, nil-safe
 }
 
 func NewVerifierManager(cfg *config.Config, credStore *credentials.Store) *VerifierManager {
@@ -49,6 +51,11 @@ func NewVerifierManager(cfg *config.Config, credStore *credentials.Store) *Verif
 		config:       cfg,
 		credStore:    credStore,
 	}
+}
+
+// SetMetrics sets the optional Prometheus gauge for cluster degraded state.
+func (m *VerifierManager) SetMetrics(degradedGauge *prometheus.GaugeVec) {
+	m.degradedGauge = degradedGauge
 }
 
 // WarmUp eagerly creates verifiers for all configured clusters.
@@ -241,6 +248,9 @@ func (m *VerifierManager) getOrCreateVerifier(ctx context.Context, name string, 
 		errMsg := err.Error()
 		slog.Error("failed to create HTTP client for OIDC verifier", "cluster", name, "error", err)
 		m.degraded[name] = errMsg
+		if m.degradedGauge != nil {
+			m.degradedGauge.WithLabelValues(name).Set(1)
+		}
 		return nil, err
 	}
 
@@ -254,6 +264,9 @@ func (m *VerifierManager) getOrCreateVerifier(ctx context.Context, name string, 
 		errMsg := fmt.Sprintf("fetching OIDC discovery from %s: %v", discoveryURL, err)
 		slog.Error("OIDC verifier creation failed", "cluster", name, "error", errMsg)
 		m.degraded[name] = errMsg
+		if m.degradedGauge != nil {
+			m.degradedGauge.WithLabelValues(name).Set(1)
+		}
 		return nil, fmt.Errorf("%s", errMsg)
 	}
 
@@ -292,6 +305,9 @@ func (m *VerifierManager) getOrCreateVerifier(ctx context.Context, name string, 
 
 	m.verifiers[name] = verifier
 	delete(m.degraded, name) // Recovery: clear degraded state on success
+	if m.degradedGauge != nil {
+		m.degradedGauge.WithLabelValues(name).Set(0)
+	}
 	return verifier, nil
 }
 

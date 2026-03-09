@@ -13,6 +13,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/prometheus/client_golang/prometheus"
 	authv1 "k8s.io/api/authentication/v1"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
@@ -50,14 +51,22 @@ type clientFactory func(cfg config.ClusterConfig, creds *Credentials) (kubernete
 // It loads credentials from Kubernetes Secrets and config files,
 // handles token renewal, and persists renewed tokens.
 type Store struct {
-	mu          sync.RWMutex
-	credentials map[string]*Credentials
-	config      *config.Config
-	client      kubernetes.Interface
-	namespace   string
-	secretName  string
-	verifier    VerifierInvalidator
-	newClient   clientFactory
+	mu            sync.RWMutex
+	credentials   map[string]*Credentials
+	config        *config.Config
+	client        kubernetes.Interface
+	namespace     string
+	secretName    string
+	verifier      VerifierInvalidator
+	newClient     clientFactory
+	renewalTotal  *prometheus.CounterVec // optional, nil-safe
+	expirySeconds *prometheus.GaugeVec   // optional, nil-safe
+}
+
+// SetMetrics sets the optional Prometheus metrics for credential renewal and expiry.
+func (s *Store) SetMetrics(renewalTotal *prometheus.CounterVec, expirySeconds *prometheus.GaugeVec) {
+	s.renewalTotal = renewalTotal
+	s.expirySeconds = expirySeconds
 }
 
 // NewStore creates a credential store and loads all credentials:
@@ -221,6 +230,9 @@ func (s *Store) tryRenew(ctx context.Context) {
 		renewBefore := s.config.GetRenewalRenewBefore()
 		if exp, err := getTokenExpiration(creds.Token); err == nil {
 			timeUntilExpiry := time.Until(exp)
+			if s.expirySeconds != nil {
+				s.expirySeconds.WithLabelValues(cluster).Set(timeUntilExpiry.Seconds())
+			}
 			if timeUntilExpiry > renewBefore {
 				slog.Debug("skipping renewal", "cluster", cluster,
 					"expires_in", timeUntilExpiry.Round(time.Minute), "threshold", renewBefore)
@@ -234,7 +246,14 @@ func (s *Store) tryRenew(ctx context.Context) {
 
 		if err := s.renewToken(ctx, cluster, cfg); err != nil {
 			slog.Error("credential renewal failed", "cluster", cluster, "error", err)
+			if s.renewalTotal != nil {
+				s.renewalTotal.WithLabelValues(cluster, "failure").Inc()
+			}
 			continue
+		}
+
+		if s.renewalTotal != nil {
+			s.renewalTotal.WithLabelValues(cluster, "success").Inc()
 		}
 
 		renewed = true

@@ -185,6 +185,36 @@ func TestConcurrentAccess(t *testing.T) {
 	wg.Wait()
 }
 
+func TestLen(t *testing.T) {
+	c := New[string](time.Minute, 10)
+	if c.Len() != 0 {
+		t.Errorf("Len() = %d, want 0", c.Len())
+	}
+
+	c.Set("a", "1")
+	c.Set("b", "2")
+	if c.Len() != 2 {
+		t.Errorf("Len() = %d, want 2", c.Len())
+	}
+
+	// Update existing key should not change length
+	c.Set("a", "updated")
+	if c.Len() != 2 {
+		t.Errorf("Len() = %d after update, want 2", c.Len())
+	}
+}
+
+func TestLen_AfterEviction(t *testing.T) {
+	c := New[string](time.Minute, 2)
+	c.Set("a", "1")
+	c.Set("b", "2")
+	c.Set("c", "3") // evicts "a"
+
+	if c.Len() != 2 {
+		t.Errorf("Len() = %d after eviction, want 2", c.Len())
+	}
+}
+
 func TestHashKey(t *testing.T) {
 	k1 := HashKey("cluster-a", "token123")
 	k2 := HashKey("cluster-a", "token123")

@@ -15,6 +15,7 @@ import (
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
 
+	"github.com/prometheus/client_golang/prometheus"
 	"github.com/rophy/kube-federated-auth/internal/cache"
 	"github.com/rophy/kube-federated-auth/internal/config"
 	"github.com/rophy/kube-federated-auth/internal/credentials"
@@ -32,13 +33,21 @@ type TokenVerifier interface {
 }
 
 type TokenReviewHandler struct {
-	verifier       TokenVerifier
-	config         *config.Config
-	credStore      *credentials.Store
-	statusProvider ClusterStatusProvider
-	caches         map[string]*cache.Cache[*authv1.TokenReview]
-	clients        map[string]kubernetes.Interface
-	clientsMu      sync.RWMutex
+	verifier          TokenVerifier
+	config            *config.Config
+	credStore         *credentials.Store
+	statusProvider    ClusterStatusProvider
+	caches            map[string]*cache.Cache[*authv1.TokenReview]
+	clients           map[string]kubernetes.Interface
+	clientsMu         sync.RWMutex
+	cacheRequestsTotal *prometheus.CounterVec // optional, nil-safe
+	cacheEntries       *prometheus.GaugeVec   // optional, nil-safe
+}
+
+// SetMetrics sets the optional Prometheus metrics for cache observability.
+func (h *TokenReviewHandler) SetMetrics(cacheRequestsTotal *prometheus.CounterVec, cacheEntries *prometheus.GaugeVec) {
+	h.cacheRequestsTotal = cacheRequestsTotal
+	h.cacheEntries = cacheEntries
 }
 
 func NewTokenReviewHandler(v TokenVerifier, cfg *config.Config, store *credentials.Store, sp ClusterStatusProvider) *TokenReviewHandler {
@@ -123,9 +132,15 @@ func (h *TokenReviewHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if c, ok := h.caches[cluster]; ok {
 		if cached, hit := c.Get(cacheKey); hit {
 			slog.DebugContext(r.Context(), "cache hit", "cluster", cluster)
+			if h.cacheRequestsTotal != nil {
+				h.cacheRequestsTotal.WithLabelValues(cluster, "hit").Inc()
+			}
 			result := cached.DeepCopy()
 			json.NewEncoder(w).Encode(result)
 			return
+		}
+		if h.cacheRequestsTotal != nil {
+			h.cacheRequestsTotal.WithLabelValues(cluster, "miss").Inc()
 		}
 	}
 
@@ -150,6 +165,9 @@ func (h *TokenReviewHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if result.Status.Authenticated {
 		if c, ok := h.caches[cluster]; ok {
 			c.Set(cacheKey, result.DeepCopy())
+			if h.cacheEntries != nil {
+				h.cacheEntries.WithLabelValues(cluster).Set(float64(c.Len()))
+			}
 		}
 	}
 

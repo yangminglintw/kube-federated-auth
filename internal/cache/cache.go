@@ -124,6 +124,13 @@ func (c *Cache[V]) evictLocked() {
 	}
 }
 
+// Len returns the number of entries currently in the cache.
+func (c *Cache[V]) Len() int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.order.Len()
+}
+
 func (c *Cache[V]) removeLocked(el *list.Element) {
 	e := el.Value.(*entry[V])
 	delete(c.items, e.key)
