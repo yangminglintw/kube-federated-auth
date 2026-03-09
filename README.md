@@ -208,6 +208,17 @@ List configured clusters and their credential status.
 | `NAMESPACE` | `kube-federated-auth` | Namespace for credential secret |
 | `SECRET_NAME` | `kube-federated-auth` | Secret name for credentials |
 
+## Testing
+
+```bash
+make test          # unit + e2e
+make test-unit     # Go unit tests
+make test-e2e      # bats e2e tests (requires Kind clusters)
+make test-perf     # k6 performance tests (requires Kind clusters)
+```
+
+See [test/README.md](test/README.md) for details on each test suite.
+
 ## License
 
 MIT
