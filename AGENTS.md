@@ -17,6 +17,16 @@ kubectl logs -n kube-federated-auth deploy/kube-federated-auth --context kind-cl
 
 See [test/README.md](test/README.md) for full details on test suites and scenarios.
 
+## Prerequisites
+
+This project uses [mise](https://mise.jdx.dev/) to manage tool versions (see `mise.toml`). The user should activate mise before starting a Claude session so that `go` is on the PATH:
+
+```bash
+eval "$(mise activate bash)"
+```
+
+If `go` is not found, ask the user to activate mise and restart the session.
+
 ## Local Development
 
 Two Kind clusters are used for testing:
