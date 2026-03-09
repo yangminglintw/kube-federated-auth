@@ -122,6 +122,28 @@ setup() {
     [[ "$clusterExtra" == "cluster-b" ]]
 }
 
+@test "TokenReview authenticates legacy SA token (kubernetes.io/service-account-token)" {
+    # Legacy Secret-based SA tokens have issuer "kubernetes/serviceaccount"
+    # instead of the OIDC issuer. They should still be verifiable via JWKS.
+    local token
+    token=$(get_legacy_sa_token test-client)
+
+    echo "# Token length: ${#token}"
+
+    local result
+    result=$(token_review "$token")
+
+    echo "# Response: $result"
+
+    local authenticated
+    authenticated=$(echo "$result" | jq -r '.status.authenticated')
+    [[ "$authenticated" == "true" ]]
+
+    local username
+    username=$(echo "$result" | jq -r '.status.user.username')
+    [[ "$username" == "system:serviceaccount:${NAMESPACE}:test-client" ]]
+}
+
 @test "TokenReview rejects invalid token" {
     local result
     result=$(token_review "invalid.token.here")

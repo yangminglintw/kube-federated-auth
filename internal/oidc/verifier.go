@@ -13,6 +13,7 @@ import (
 	"os"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/coreos/go-oidc/v3/oidc"
 	"github.com/rophy/kube-federated-auth/internal/config"
@@ -114,6 +115,12 @@ func (m *VerifierManager) Verify(ctx context.Context, clusterName, rawToken stri
 	token, err := verifier.Verify(ctx, rawToken)
 	if err != nil {
 		return nil, fmt.Errorf("verifying token: %w", err)
+	}
+
+	// Manual expiry check: go-oidc SkipExpiryCheck is enabled to support legacy SA tokens
+	// (which have no exp claim). If exp IS present and the token is expired, reject it.
+	if !token.Expiry.IsZero() && token.Expiry.Before(time.Now()) {
+		return nil, fmt.Errorf("verifying token: token is expired")
 	}
 
 	// After successful verification, learn the kid→cluster mapping
@@ -272,9 +279,15 @@ func (m *VerifierManager) getOrCreateVerifier(ctx context.Context, name string, 
 	ctx = oidc.ClientContext(ctx, httpClient)
 	keySet := oidc.NewRemoteKeySet(ctx, jwksURL)
 
-	// Create verifier with the actual issuer from the token (not the discovery URL)
+	// Create verifier with the actual issuer from the token (not the discovery URL).
+	// SkipIssuerCheck: legacy SA tokens have issuer "kubernetes/serviceaccount" instead of
+	// the OIDC issuer. JWKS keys provide the real trust boundary.
+	// SkipExpiryCheck: legacy SA tokens have no exp claim (go-oidc treats zero time as expired).
+	// We manually check expiry in Verify() for tokens that DO have exp.
 	verifier := oidc.NewVerifier(cfg.Issuer, keySet, &oidc.Config{
 		SkipClientIDCheck: true,
+		SkipIssuerCheck:   true,
+		SkipExpiryCheck:   true,
 	})
 
 	m.verifiers[name] = verifier

@@ -50,6 +50,37 @@ get_unauthorized_caller_token() {
     kubectl --context "$KUBE_CONTEXT" -n "$NAMESPACE" create token default --duration=10m
 }
 
+# Create a legacy SA token (type: kubernetes.io/service-account-token) for cluster-a
+# These tokens have issuer "kubernetes/serviceaccount" instead of the OIDC issuer
+get_legacy_sa_token() {
+    local sa="${1:-test-client}"
+    local secret_name="legacy-sa-token-test"
+    # Create a legacy-style Secret bound to the SA
+    kubectl --context "$KUBE_CONTEXT" -n "$NAMESPACE" apply -f - >/dev/null <<EOF
+apiVersion: v1
+kind: Secret
+metadata:
+  name: ${secret_name}
+  annotations:
+    kubernetes.io/service-account.name: ${sa}
+type: kubernetes.io/service-account-token
+EOF
+    # Wait for the token controller to populate the token
+    local attempts=0
+    while [[ $attempts -lt 10 ]]; do
+        local token
+        token=$(kubectl --context "$KUBE_CONTEXT" -n "$NAMESPACE" get secret "$secret_name" -o jsonpath='{.data.token}' 2>/dev/null)
+        if [[ -n "$token" ]]; then
+            echo "$token" | base64 -d
+            return 0
+        fi
+        sleep 1
+        attempts=$((attempts + 1))
+    done
+    echo "ERROR: legacy SA token not populated after 10s" >&2
+    return 1
+}
+
 # Run kubectl against cluster-a in the kube-federated-auth namespace
 ka() {
     kubectl --context "$KUBE_CONTEXT" -n "$NAMESPACE" "$@"
