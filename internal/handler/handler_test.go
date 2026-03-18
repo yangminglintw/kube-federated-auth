@@ -8,10 +8,16 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	authv1 "k8s.io/api/authentication/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
+	fakekube "k8s.io/client-go/kubernetes/fake"
+	k8stesting "k8s.io/client-go/testing"
 
 	"github.com/rophy/kube-federated-auth/internal/config"
 	"github.com/rophy/kube-federated-auth/internal/credentials"
@@ -801,4 +807,140 @@ func TestBuildRESTConfig(t *testing.T) {
 			t.Errorf("Host = %q, want %q", rc.Host, "https://issuer.example.com")
 		}
 	})
+}
+
+// newFakeClientWithCounter creates a fake K8s client that counts TokenReview calls
+// and adds an optional delay to simulate latency.
+func newFakeClientWithCounter(callCount *atomic.Int32, delay time.Duration, authenticated bool) *fakekube.Clientset {
+	client := fakekube.NewSimpleClientset()
+	client.PrependReactor("create", "tokenreviews", func(action k8stesting.Action) (bool, runtime.Object, error) {
+		callCount.Add(1)
+		if delay > 0 {
+			time.Sleep(delay)
+		}
+		return true, &authv1.TokenReview{
+			TypeMeta: metav1.TypeMeta{
+				APIVersion: "authentication.k8s.io/v1",
+				Kind:       "TokenReview",
+			},
+			Status: authv1.TokenReviewStatus{
+				Authenticated: authenticated,
+				User: authv1.UserInfo{
+					Username: "system:serviceaccount:default:test-sa",
+				},
+			},
+		}, nil
+	})
+	return client
+}
+
+func TestSingleflight_DeduplicatesConcurrentRequests(t *testing.T) {
+	var callCount atomic.Int32
+	fakeClient := newFakeClientWithCounter(&callCount, 100*time.Millisecond, true)
+
+	cfg := &config.Config{
+		Cache: &config.CacheSettings{TTL: 60, MaxEntries: 1000},
+		Clusters: map[string]config.ClusterConfig{
+			"cluster-a": {Issuer: "https://a.example.com"},
+		},
+	}
+	verifier := &mockVerifier{
+		claims: map[string]*oidc.Claims{
+			"test-token": {
+				Subject: "system:serviceaccount:default:test-sa",
+				Kubernetes: map[string]any{
+					"namespace":      "default",
+					"serviceaccount": map[string]any{"name": "test-sa"},
+				},
+			},
+		},
+	}
+
+	h := NewTokenReviewHandler(verifier, cfg, nil, nil)
+	h.clients["cluster-a"] = fakeClient
+
+	const concurrency = 10
+	var wg sync.WaitGroup
+	results := make([]*authv1.TokenReview, concurrency)
+
+	for i := range concurrency {
+		wg.Add(1)
+		go func(idx int) {
+			defer wg.Done()
+			body := `{"apiVersion":"authentication.k8s.io/v1","kind":"TokenReview","spec":{"token":"test-token"}}`
+			req := httptest.NewRequest(http.MethodPost, "/apis/authentication.k8s.io/v1/tokenreviews", strings.NewReader(body))
+			w := httptest.NewRecorder()
+			h.ServeHTTP(w, req)
+
+			var resp authv1.TokenReview
+			json.Unmarshal(w.Body.Bytes(), &resp)
+			results[idx] = &resp
+		}(i)
+	}
+	wg.Wait()
+
+	if count := callCount.Load(); count != 1 {
+		t.Errorf("expected 1 upstream call, got %d", count)
+	}
+
+	for i, resp := range results {
+		if !resp.Status.Authenticated {
+			t.Errorf("request %d: expected authenticated=true", i)
+		}
+	}
+}
+
+func TestNegativeCaching_UnauthenticatedResultsCached(t *testing.T) {
+	var callCount atomic.Int32
+	fakeClient := newFakeClientWithCounter(&callCount, 0, false)
+
+	cfg := &config.Config{
+		Cache: &config.CacheSettings{TTL: 60, NegativeTTL: 30, MaxEntries: 1000},
+		Clusters: map[string]config.ClusterConfig{
+			"cluster-a": {Issuer: "https://a.example.com"},
+		},
+	}
+	verifier := &mockVerifier{
+		claims: map[string]*oidc.Claims{
+			"bad-token": {
+				Subject: "system:serviceaccount:default:bad-sa",
+				Kubernetes: map[string]any{
+					"namespace":      "default",
+					"serviceaccount": map[string]any{"name": "bad-sa"},
+				},
+			},
+		},
+	}
+
+	h := NewTokenReviewHandler(verifier, cfg, nil, nil)
+	h.clients["cluster-a"] = fakeClient
+
+	body := `{"apiVersion":"authentication.k8s.io/v1","kind":"TokenReview","spec":{"token":"bad-token"}}`
+
+	// First request: cache miss, calls upstream
+	req := httptest.NewRequest(http.MethodPost, "/apis/authentication.k8s.io/v1/tokenreviews", strings.NewReader(body))
+	w := httptest.NewRecorder()
+	h.ServeHTTP(w, req)
+
+	var resp authv1.TokenReview
+	json.Unmarshal(w.Body.Bytes(), &resp)
+	if resp.Status.Authenticated {
+		t.Error("first request: expected authenticated=false")
+	}
+	if callCount.Load() != 1 {
+		t.Errorf("first request: expected 1 upstream call, got %d", callCount.Load())
+	}
+
+	// Second request: should be served from negative cache
+	req = httptest.NewRequest(http.MethodPost, "/apis/authentication.k8s.io/v1/tokenreviews", strings.NewReader(body))
+	w = httptest.NewRecorder()
+	h.ServeHTTP(w, req)
+
+	json.Unmarshal(w.Body.Bytes(), &resp)
+	if resp.Status.Authenticated {
+		t.Error("second request: expected authenticated=false")
+	}
+	if callCount.Load() != 1 {
+		t.Errorf("second request: expected still 1 upstream call (cached), got %d", callCount.Load())
+	}
 }
