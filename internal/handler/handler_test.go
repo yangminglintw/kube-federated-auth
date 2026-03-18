@@ -507,7 +507,7 @@ func TestTokenReviewHandler_CacheConstructedFromConfig(t *testing.T) {
 	}
 }
 
-func TestTokenReviewHandler_CacheDisabledByDefault(t *testing.T) {
+func TestTokenReviewHandler_CacheEnabledByDefault(t *testing.T) {
 	cfg := &config.Config{
 		Clusters: map[string]config.ClusterConfig{
 			"cluster-a": {Issuer: "https://a.example.com"},
@@ -515,8 +515,8 @@ func TestTokenReviewHandler_CacheDisabledByDefault(t *testing.T) {
 	}
 	h := NewTokenReviewHandler(nil, cfg, nil, nil)
 
-	if len(h.caches) != 0 {
-		t.Errorf("expected no caches when cache not configured, got %d", len(h.caches))
+	if _, ok := h.caches["cluster-a"]; !ok {
+		t.Error("expected cache for cluster-a from defaults")
 	}
 }
 

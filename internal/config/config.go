@@ -69,7 +69,11 @@ type CacheSettings struct {
 	MaxEntries  int `yaml:"max_entries"`  // max cached entries, 0 = disabled
 }
 
-const DefaultNegativeTTL = 30 // seconds
+const (
+	DefaultNegativeTTL   = 30   // seconds
+	DefaultCacheTTL      = 60   // seconds
+	DefaultMaxEntries    = 1000
+)
 
 // GetNegativeTTL returns the negative TTL, defaulting to DefaultNegativeTTL if not set.
 func (cs *CacheSettings) GetNegativeTTL() int {
@@ -193,14 +197,23 @@ func Load(path string) (*Config, error) {
 	return &cfg, nil
 }
 
+// DefaultCacheSettings returns the built-in default cache settings.
+var DefaultCacheSettings = &CacheSettings{
+	TTL:        DefaultCacheTTL,
+	MaxEntries: DefaultMaxEntries,
+}
+
 // GetCacheSettings returns the cache settings for a cluster.
 // Per-cluster settings take precedence over global settings.
-// Returns nil if no cache is configured.
+// Falls back to built-in defaults if no cache is configured.
 func (c *Config) GetCacheSettings(clusterName string) *CacheSettings {
 	if cluster, ok := c.Clusters[clusterName]; ok && cluster.Cache != nil {
 		return cluster.Cache
 	}
-	return c.Cache
+	if c.Cache != nil {
+		return c.Cache
+	}
+	return DefaultCacheSettings
 }
 
 func (c *Config) ClusterNames() []string {

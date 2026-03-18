@@ -11,13 +11,14 @@ renewal:
   token_duration: "168h"  # Requested token TTL (default: 168h / 7 days)
   renew_before: "48h"     # Renew if token expires within this duration (default: 48h / 2 days)
 
-# Global TokenReview response cache (optional, disabled by default)
+# Global TokenReview response cache (optional, enabled by default: ttl=60, max_entries=1000)
 # Caches both authenticated and unauthenticated results to reduce upstream API calls.
 # Per-cluster cache blocks override global settings entirely.
+# To disable, set ttl: 0 or max_entries: 0.
 cache:
-  ttl: 60             # Cache TTL in seconds for authenticated results (0 = disabled)
+  ttl: 60             # Cache TTL in seconds for authenticated results (default: 60)
   negative_ttl: 30    # Cache TTL in seconds for unauthenticated results (default: 30)
-  max_entries: 1000   # Max cached entries (0 = disabled)
+  max_entries: 1000   # Max cached entries (default: 1000)
 
 clusters:
   # EKS cluster (public OIDC endpoint)

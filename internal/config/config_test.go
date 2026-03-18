@@ -451,7 +451,7 @@ clusters:
 	}
 }
 
-func TestGetCacheSettings_NoCacheConfigured(t *testing.T) {
+func TestGetCacheSettings_DefaultsWhenNoCacheConfigured(t *testing.T) {
 	content := `
 clusters:
   cluster-a:
@@ -460,8 +460,14 @@ clusters:
 	cfg := loadFromString(t, content)
 
 	cs := cfg.GetCacheSettings("cluster-a")
-	if cs != nil {
-		t.Errorf("expected nil cache settings, got %+v", cs)
+	if cs == nil {
+		t.Fatal("expected default cache settings, got nil")
+	}
+	if cs.TTL != DefaultCacheTTL {
+		t.Errorf("TTL = %d, want %d", cs.TTL, DefaultCacheTTL)
+	}
+	if cs.MaxEntries != DefaultMaxEntries {
+		t.Errorf("MaxEntries = %d, want %d", cs.MaxEntries, DefaultMaxEntries)
 	}
 }
 
