@@ -64,8 +64,19 @@ func (r *RenewalSettings) UnmarshalYAML(unmarshal func(interface{}) error) error
 
 // CacheSettings configures the TokenReview response cache.
 type CacheSettings struct {
-	TTL        int `yaml:"ttl"`         // seconds, 0 = disabled
-	MaxEntries int `yaml:"max_entries"` // max cached entries, 0 = disabled
+	TTL         int `yaml:"ttl"`          // seconds, 0 = disabled
+	NegativeTTL int `yaml:"negative_ttl"` // seconds for unauthenticated results, 0 = disabled (default: 30)
+	MaxEntries  int `yaml:"max_entries"`  // max cached entries, 0 = disabled
+}
+
+const DefaultNegativeTTL = 30 // seconds
+
+// GetNegativeTTL returns the negative TTL, defaulting to DefaultNegativeTTL if not set.
+func (cs *CacheSettings) GetNegativeTTL() int {
+	if cs.NegativeTTL > 0 {
+		return cs.NegativeTTL
+	}
+	return DefaultNegativeTTL
 }
 
 type ClusterConfig struct {

@@ -31,6 +31,7 @@ const (
 	callerIdentityKey contextKey = iota
 	clientIdentityKey
 	errorMessageKey
+	cacheStatusKey
 )
 
 // SetCallerIdentity stores the caller identity in the request context.
@@ -54,6 +55,19 @@ func SetClientIdentity(ctx context.Context, identity string) context.Context {
 // GetClientIdentity retrieves the client identity from context.
 func GetClientIdentity(ctx context.Context) string {
 	if v, ok := ctx.Value(clientIdentityKey).(string); ok {
+		return v
+	}
+	return ""
+}
+
+// SetCacheStatus stores the cache status (hit/miss) in the request context.
+func SetCacheStatus(ctx context.Context, status string) context.Context {
+	return context.WithValue(ctx, cacheStatusKey, status)
+}
+
+// GetCacheStatus retrieves the cache status from context.
+func GetCacheStatus(ctx context.Context) string {
+	if v, ok := ctx.Value(cacheStatusKey).(string); ok {
 		return v
 	}
 	return ""
@@ -95,6 +109,9 @@ func RequestLogger(logger *slog.Logger) func(http.Handler) http.Handler {
 			}
 			if client := GetClientIdentity(r.Context()); client != "" {
 				attrs = append(attrs, slog.String("client", client))
+			}
+			if cs := GetCacheStatus(r.Context()); cs != "" {
+				attrs = append(attrs, slog.String("cache", cs))
 			}
 			errMsg := GetErrorMessage(r.Context())
 			if errMsg != "" {

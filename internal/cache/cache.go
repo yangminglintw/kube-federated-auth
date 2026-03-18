@@ -71,7 +71,13 @@ func (c *Cache[V]) Get(key string) (V, bool) {
 // Set stores a value with the configured TTL. If the cache is at capacity,
 // the least-recently-used entry is evicted.
 func (c *Cache[V]) Set(key string, value V) {
-	if !c.Enabled() {
+	c.SetWithTTL(key, value, c.ttl)
+}
+
+// SetWithTTL stores a value with a custom TTL. If the cache is at capacity,
+// the least-recently-used entry is evicted.
+func (c *Cache[V]) SetWithTTL(key string, value V, ttl time.Duration) {
+	if !c.Enabled() || ttl <= 0 {
 		return
 	}
 
@@ -82,7 +88,7 @@ func (c *Cache[V]) Set(key string, value V) {
 	if el, ok := c.items[key]; ok {
 		e := el.Value.(*entry[V])
 		e.value = value
-		e.expiresAt = c.now().Add(c.ttl)
+		e.expiresAt = c.now().Add(ttl)
 		c.order.MoveToFront(el)
 		return
 	}
@@ -95,7 +101,7 @@ func (c *Cache[V]) Set(key string, value V) {
 	e := &entry[V]{
 		key:       key,
 		value:     value,
-		expiresAt: c.now().Add(c.ttl),
+		expiresAt: c.now().Add(ttl),
 	}
 	el := c.order.PushFront(e)
 	c.items[key] = el

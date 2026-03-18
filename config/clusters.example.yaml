@@ -12,10 +12,11 @@ renewal:
   renew_before: "48h"     # Renew if token expires within this duration (default: 48h / 2 days)
 
 # Global TokenReview response cache (optional, disabled by default)
-# Caches authenticated=true results to reduce upstream API calls.
+# Caches both authenticated and unauthenticated results to reduce upstream API calls.
 # Per-cluster cache blocks override global settings entirely.
 cache:
-  ttl: 60             # Cache TTL in seconds (0 = disabled)
+  ttl: 60             # Cache TTL in seconds for authenticated results (0 = disabled)
+  negative_ttl: 30    # Cache TTL in seconds for unauthenticated results (default: 30)
   max_entries: 1000   # Max cached entries (0 = disabled)
 
 clusters:

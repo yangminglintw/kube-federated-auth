@@ -21,6 +21,7 @@ import (
 	"github.com/rophy/kube-federated-auth/internal/credentials"
 	mw "github.com/rophy/kube-federated-auth/internal/middleware"
 	"github.com/rophy/kube-federated-auth/internal/oidc"
+	"golang.org/x/sync/singleflight"
 )
 
 // ExtraKeyClusterName is the key used in TokenReview response extra field
@@ -38,8 +39,10 @@ type TokenReviewHandler struct {
 	credStore         *credentials.Store
 	statusProvider    ClusterStatusProvider
 	caches            map[string]*cache.Cache[*authv1.TokenReview]
+	negativeTTLs      map[string]time.Duration
 	clients           map[string]kubernetes.Interface
 	clientsMu         sync.RWMutex
+	inflight          singleflight.Group
 	cacheRequestsTotal *prometheus.CounterVec // optional, nil-safe
 	cacheEntries       *prometheus.GaugeVec   // optional, nil-safe
 }
@@ -57,6 +60,7 @@ func NewTokenReviewHandler(v TokenVerifier, cfg *config.Config, store *credentia
 		credStore:      store,
 		statusProvider: sp,
 		caches:         make(map[string]*cache.Cache[*authv1.TokenReview]),
+		negativeTTLs:   make(map[string]time.Duration),
 		clients:        make(map[string]kubernetes.Interface),
 	}
 
@@ -66,6 +70,7 @@ func NewTokenReviewHandler(v TokenVerifier, cfg *config.Config, store *credentia
 				h.caches[name] = cache.New[*authv1.TokenReview](
 					time.Duration(cs.TTL)*time.Second, cs.MaxEntries,
 				)
+				h.negativeTTLs[name] = time.Duration(cs.GetNegativeTTL()) * time.Second
 			}
 		}
 	}
@@ -132,6 +137,7 @@ func (h *TokenReviewHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if c, ok := h.caches[cluster]; ok {
 		if cached, hit := c.Get(cacheKey); hit {
 			slog.DebugContext(r.Context(), "cache hit", "cluster", cluster)
+			*r = *r.WithContext(mw.SetCacheStatus(r.Context(), "hit"))
 			if h.cacheRequestsTotal != nil {
 				h.cacheRequestsTotal.WithLabelValues(cluster, "hit").Inc()
 			}
@@ -139,37 +145,50 @@ func (h *TokenReviewHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			json.NewEncoder(w).Encode(result)
 			return
 		}
+		*r = *r.WithContext(mw.SetCacheStatus(r.Context(), "miss"))
 		if h.cacheRequestsTotal != nil {
 			h.cacheRequestsTotal.WithLabelValues(cluster, "miss").Inc()
 		}
 	}
 
-	// Step 2: Forward TokenReview to detected cluster
-	result, err := h.forwardTokenReview(r.Context(), cluster, &tr)
-	if err != nil {
-		slog.ErrorContext(r.Context(), "tokenreview forwarding failed",
-			"cluster", cluster, "error", err)
-		h.writeUnauthenticated(w, &tr, fmt.Sprintf("failed to validate token: %v", err))
-		return
-	}
-
-	// Add cluster name to extra field for client awareness
-	if result.Status.Authenticated {
-		if result.Status.User.Extra == nil {
-			result.Status.User.Extra = make(map[string]authv1.ExtraValue)
+	// Step 2: Forward TokenReview to detected cluster (with singleflight dedup)
+	sfResult, sfErr, _ := h.inflight.Do(cacheKey, func() (any, error) {
+		result, err := h.forwardTokenReview(context.Background(), cluster, &tr)
+		if err != nil {
+			return nil, err
 		}
-		result.Status.User.Extra[ExtraKeyClusterName] = authv1.ExtraValue{cluster}
-	}
 
-	// Cache authenticated results
-	if result.Status.Authenticated {
+		// Add cluster name to extra field for client awareness
+		if result.Status.Authenticated {
+			if result.Status.User.Extra == nil {
+				result.Status.User.Extra = make(map[string]authv1.ExtraValue)
+			}
+			result.Status.User.Extra[ExtraKeyClusterName] = authv1.ExtraValue{cluster}
+		}
+
+		// Cache the result
 		if c, ok := h.caches[cluster]; ok {
-			c.Set(cacheKey, result.DeepCopy())
+			if result.Status.Authenticated {
+				c.Set(cacheKey, result.DeepCopy())
+			} else if negTTL, ok := h.negativeTTLs[cluster]; ok {
+				c.SetWithTTL(cacheKey, result.DeepCopy(), negTTL)
+			}
 			if h.cacheEntries != nil {
 				h.cacheEntries.WithLabelValues(cluster).Set(float64(c.Len()))
 			}
 		}
+
+		return result, nil
+	})
+
+	if sfErr != nil {
+		slog.ErrorContext(r.Context(), "tokenreview forwarding failed",
+			"cluster", cluster, "error", sfErr)
+		h.writeUnauthenticated(w, &tr, fmt.Sprintf("failed to validate token: %v", sfErr))
+		return
 	}
+
+	result := sfResult.(*authv1.TokenReview).DeepCopy()
 
 	// Return the response from the remote cluster
 	json.NewEncoder(w).Encode(result)
