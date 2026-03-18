@@ -261,13 +261,35 @@ func (m *VerifierManager) getOrCreateVerifier(ctx context.Context, name string, 
 	// Fetch OIDC discovery document from the discovery URL
 	discovery, err := m.fetchDiscovery(ctx, httpClient, discoveryURL)
 	if err != nil {
-		errMsg := fmt.Sprintf("fetching OIDC discovery from %s: %v", discoveryURL, err)
-		slog.Error("OIDC verifier creation failed", "cluster", name, "error", errMsg)
-		m.degraded[name] = errMsg
-		if m.degradedGauge != nil {
-			m.degradedGauge.WithLabelValues(name).Set(1)
+		// If discovery fails and a token_path is available, the stored token may be stale.
+		// Retry with the mounted token as a fallback.
+		if cfg.TokenPath != "" {
+			slog.Warn("OIDC discovery failed with stored token, retrying with mounted token",
+				"cluster", name, "token_path", cfg.TokenPath, "error", err)
+			fallbackClient, fbErr := m.createHTTPClientFromTokenPath(cfg)
+			if fbErr == nil {
+				discovery, err = m.fetchDiscovery(ctx, fallbackClient, discoveryURL)
+				if err == nil {
+					httpClient = fallbackClient
+					// Clear the stale token so future requests use token_path
+					if m.credStore != nil {
+						m.credStore.ClearToken(name)
+						slog.Info("cleared stale token from credential store", "cluster", name)
+					}
+				}
+			} else {
+				slog.Error("failed to create fallback HTTP client", "cluster", name, "error", fbErr)
+			}
 		}
-		return nil, fmt.Errorf("%s", errMsg)
+		if err != nil {
+			errMsg := fmt.Sprintf("fetching OIDC discovery from %s: %v", discoveryURL, err)
+			slog.Error("OIDC verifier creation failed", "cluster", name, "error", errMsg)
+			m.degraded[name] = errMsg
+			if m.degradedGauge != nil {
+				m.degradedGauge.WithLabelValues(name).Set(1)
+			}
+			return nil, fmt.Errorf("%s", errMsg)
+		}
 	}
 
 	// Create a remote key set that fetches JWKS from the discovery URL's JWKS endpoint
@@ -354,6 +376,36 @@ func rewriteJWKSURL(jwksURL, apiServer string) string {
 
 	// Fallback: just use the original URL
 	return jwksURL
+}
+
+// createHTTPClientFromTokenPath creates an HTTP client that reads the token from
+// a file on each request, bypassing the credential store. Used as a fallback when
+// the stored token is stale.
+func (m *VerifierManager) createHTTPClientFromTokenPath(cfg config.ClusterConfig) (*http.Client, error) {
+	var transport http.RoundTripper = http.DefaultTransport
+
+	if cfg.CACert != "" {
+		caCert, err := os.ReadFile(cfg.CACert)
+		if err != nil {
+			return nil, fmt.Errorf("reading CA cert: %w", err)
+		}
+		caCertPool := x509.NewCertPool()
+		if !caCertPool.AppendCertsFromPEM(caCert) {
+			return nil, fmt.Errorf("failed to parse CA cert")
+		}
+		transport = &http.Transport{
+			TLSClientConfig: &tls.Config{
+				RootCAs: caCertPool,
+			},
+		}
+	}
+
+	transport = &tokenRoundTripper{
+		transport: transport,
+		tokenPath: cfg.TokenPath,
+	}
+
+	return &http.Client{Transport: transport}, nil
 }
 
 func (m *VerifierManager) createHTTPClient(clusterName string, cfg config.ClusterConfig) (*http.Client, error) {

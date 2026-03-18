@@ -173,6 +173,16 @@ func (s *Store) SetToken(cluster, token string) {
 	}
 }
 
+// ClearToken removes a cluster's token from memory, forcing fallback to token_path.
+func (s *Store) ClearToken(cluster string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if existing, ok := s.credentials[cluster]; ok {
+		existing.Token = ""
+		existing.source = tokenMounted
+	}
+}
+
 // SetCACert updates a cluster's CA cert in-memory.
 func (s *Store) SetCACert(cluster string, caCert []byte) {
 	s.mu.Lock()
